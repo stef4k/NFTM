@@ -1,0 +1,110 @@
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env/
+.conda/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# PyTorch model files and training outputs
+*.pt
+*.pth
+*.ckpt
+model_*.pt
+checkpoint_*.pt
+
+# Experimental results and outputs
+results_*/
+out/
+outputs/
+experiments/
+logs/
+runs/
+
+# Generated visualizations and plots (except figures/ for README)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+!figures/
+!figures/**
+
+# Dataset downloads
+data/
+datasets/
+cifar-10-*
+*.tar.gz
+*.zip
+
+# Metrics and analysis files
+metrics.json
+*.npy
+*.csv
+*.log
+*.txt
+
+# Temporary files
+temp/
+tmp/
+.tmp/
+*.tmp
+
+# OS generated files
+Thumbs.db
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# Configuration files (if containing sensitive data)
+config.yaml
+config.json
+.env
+
+# Large files that shouldn't be tracked
+*.h5
+*.hdf5
+*.pickle
+*.pkl
+
+# NFTM specific output directories
+results_rule110/
+results_variable_*/
+results_learnable_alpha_*/
+results_stability_*/
+results_baseline_*/
+results_test_alpha_*/
+
+# Generated documentation
+docs/_build/
+site/
+
+# Keep these specific figures for README display
+!alpha_learning_test.png
+!life_blinker.gif
+!life_glider.gif
+!life_random.gif
+!visualization_learnable_alpha_64.png
+!visualization_variable_64.png
