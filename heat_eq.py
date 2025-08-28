@@ -1330,6 +1330,7 @@ def main():
     # Model parameters
     parser.add_argument('--size', type=int, default=32, help='Grid size (H=W)')
     parser.add_argument('--timesteps', type=int, default=10, help='Number of timesteps')
+    parser.add_argument('--eval_timesteps', type=int, default=None, help='Number of timesteps for evaluation/rollout (default: same as training)')
     parser.add_argument('--pe_freqs', type=int, default=8, help='Fourier PE frequencies')
     parser.add_argument('--hidden_dim', type=int, default=128, help='Hidden dimension')
     
@@ -1463,14 +1464,19 @@ def main():
         # Phase A
         print("\nPhase A: Teacher-forced training")
         losses_a = train_phase_a(model, opt, mse, args, device)
-        
-        # Phase B
-        print("\nPhase B: Rollout training")
-        losses_b, psnrs = train_phase_b(model, opt, mse, args, device)
-        
-        # Visualize
-        visualize_results(model, args, device, mode_name)
-        
+
+        # Phase B and visualization: use eval_timesteps if set and mode==variable
+        if args.mode == 'variable' and args.eval_timesteps is not None:
+            eval_args = argparse.Namespace(**vars(args))
+            eval_args.timesteps = args.eval_timesteps
+            print(f"\nPhase B: Rollout training (eval horizon: {eval_args.timesteps})")
+            losses_b, psnrs = train_phase_b(model, opt, mse, eval_args, device)
+            visualize_results(model, eval_args, device, mode_name)
+        else:
+            print("\nPhase B: Rollout training")
+            losses_b, psnrs = train_phase_b(model, opt, mse, args, device)
+            visualize_results(model, args, device, mode_name)
+
         # Save model
         torch.save(model.state_dict(), output_dir / f'model_{args.mode}.pt')
         print(f"\nModel saved to {output_dir}/model_{args.mode}.pt")

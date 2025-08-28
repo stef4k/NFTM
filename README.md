@@ -47,6 +47,17 @@ python3 heat_eq.py --mode variable
 ```
 Outputs for each mode are stored in `results_<mode>_<size>/`.
 
+### Generalization Beyond Training Horizon (Variable α Mode)
+You can test if the model generalizes to longer rollouts than it was trained on by using the `--eval_timesteps` flag:
+
+```bash
+python3 heat_eq.py --mode variable --timesteps 10 --eval_timesteps 20 --epochs_a 50 --epochs_b 50 --size 32 --batch_size 4
+```
+
+- `--timesteps`: number of steps used during training
+- `--eval_timesteps`: number of steps for evaluation/rollout (can be longer than training)
+- The output PSNR curve and visualizations will show how well the model extrapolates to longer horizons.
+
 ## Image Inpainting
 Iteratively inpaint masked CIFAR‑10 images. Recommended command:
 ```bash
