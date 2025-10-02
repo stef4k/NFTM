@@ -6,7 +6,7 @@ Neural Field Turing Machine experiments implementing differentiable cellular aut
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/<user>/NFTM.git
+   git clone https://github.com/akashjorss/NFTM.git
    cd NFTM
    ```
 2. **Install dependencies** (Python 3.8+)
