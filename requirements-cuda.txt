@@ -1,0 +1,8 @@
+# Core dependencies for running NFTM experiments with CUDA acceleration
+--extra-index-url https://download.pytorch.org/whl/cu118
+numpy>=1.23
+matplotlib>=3.7
+pillow>=10.0
+imageio>=2.31
+torch==2.1.2+cu118
+torchvision==0.16.2+cu118

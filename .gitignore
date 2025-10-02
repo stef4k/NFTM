@@ -62,6 +62,9 @@ metrics.json
 *.csv
 *.log
 *.txt
+# Dependency manifests
+!requirements.txt
+!requirements-*.txt
 
 # Temporary files
 temp/
