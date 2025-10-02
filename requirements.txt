@@ -1,0 +1,7 @@
+# Core dependencies for running NFTM experiments without CUDA acceleration
+numpy>=1.23
+matplotlib>=3.7
+pillow>=10.0
+imageio>=2.31
+torch>=2.1
+torchvision>=0.16
