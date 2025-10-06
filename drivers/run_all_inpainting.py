@@ -190,7 +190,8 @@ def main(argv: List[str] | None = None) -> None:
             "tvl1_baseline",
             [
                 py_executable,
-                "tvl1_baseline.py",
+                "-m",
+                "baselines.inpainting.tvl1_baseline",
                 "--iters",
                 str(args.tvl1_iters),
                 "--lam",

@@ -170,7 +170,7 @@ def _run_cnn(cfg: DriverArgs) -> Mapping[str, object]:
     train_cmd = [
         cfg.py_executable,
         "-m",
-        "baselines.cnn_baseline",
+        "baselines.heat_eq.cnn_baseline",
         "--size",
         str(cfg.size),
         "--timesteps",
@@ -220,7 +220,7 @@ def _run_pinn_alpha(cfg: DriverArgs) -> Mapping[str, object]:
     train_cmd = [
         cfg.py_executable,
         "-m",
-        "baselines.pinn_alpha",
+        "baselines.heat_eq.pinn_alpha",
         "--size",
         str(cfg.size),
         "--timesteps",
@@ -269,7 +269,7 @@ def _run_pinn_mlp(cfg: DriverArgs) -> Mapping[str, object]:
     train_cmd = [
         cfg.py_executable,
         "-m",
-        "baselines.pinn_mlp",
+        "baselines.heat_eq.pinn_mlp",
         "--size",
         str(cfg.size),
         "--timesteps",

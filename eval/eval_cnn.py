@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from baselines.cnn_baseline import CNNResidualStep
+from baselines.heat_eq.cnn_baseline import CNNResidualStep
 from common.heat_metrics import scalar_rollout_psnr, scalar_rollout_ssim
 from heat_eq import generate_sequence
 
