@@ -8,8 +8,8 @@ project. After training, the learned parameter is evaluated by rolling out a
 sequence and comparing it against the ground-truth simulator using PSNR.
 
 Example usage:
-    python -m baselines.pinn_alpha --size 32 --timesteps 16 --epochs 400
-    python -m baselines.pinn_alpha --size 32 --timesteps 16 --spatial_alpha \
+    python -m baselines.heat_eq.pinn_alpha --size 32 --timesteps 16 --epochs 400
+    python -m baselines.heat_eq.pinn_alpha --size 32 --timesteps 16 --spatial_alpha \
         --lambda_pde 1.0 --epochs 800
 """
 
