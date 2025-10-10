@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 from metrics import lpips_dist as _metric_lpips
 from metrics import psnr as _metric_psnr
 from metrics import ssim as _metric_ssim
-from unet_model import DoubleConv as UNetDoubleConv, UpBlock as UNetUpBlock, TinyUNet
+from unet_model import TinyUNet
 
 # -------------------------- Utilities --------------------------
 
@@ -147,32 +147,16 @@ class TinyController(nn.Module):
 class UNetController(nn.Module):
     def __init__(self, in_ch=4, base=10):
         super().__init__()
-        c1, c2, c3 = base, base * 2, int(round(base * 2.8))
-        self.enc1 = UNetDoubleConv(in_ch, c1)
-        self.down1 = nn.Conv2d(c1, c2, 3, stride=2, padding=1)
-        self.enc2 = UNetDoubleConv(c2, c2)
-        self.down2 = nn.Conv2d(c2, c3, 3, stride=2, padding=1)
-        self.mid = UNetDoubleConv(c3, c3)
-        self.up1 = UNetUpBlock(c3, c2, c2)
-        self.up2 = UNetUpBlock(c2, c1, c1)
-        self.head_dI = nn.Conv2d(c1, 3, 3, padding=1)
-        self.head_gate = nn.Conv2d(c1, 1, 3, padding=1)
-        self.head_logS = nn.Conv2d(c1, 3, 3, padding=1)
-
-        self.apply(TinyUNet._init_weights)
+        self.unet = TinyUNet(in_ch=in_ch, out_ch=7, base=base)
+        # For controller usage we need linear outputs; override the final activation.
+        self.unet.activation = nn.Identity()
 
     def forward(self, I, M):
         x = torch.cat([I, M], dim=1)
-        s1 = self.enc1(x)
-        d1 = self.down1(s1)
-        s2 = self.enc2(d1)
-        d2 = self.down2(s2)
-        h = self.mid(d2)
-        u1 = self.up1(h, s2)
-        u2 = self.up2(u1, s1)
-        dI = self.head_dI(u2).tanh()
-        gate = torch.sigmoid(self.head_gate(u2))
-        logS = self.head_logS(u2)
+        out = self.unet(x)
+        dI_raw, gate_raw, logS = torch.split(out, [3, 1, 3], dim=1)
+        dI = torch.tanh(dI_raw)
+        gate = torch.sigmoid(gate_raw)
         return dI, gate, logS
 
 def nftm_step(I, I_gt, M, controller, beta=0.5, corr_clip=0.2, clip_decay=1.0):
