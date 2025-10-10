@@ -72,3 +72,31 @@ python3 run_experiments.py --runs_dir runs/ablations
 ```
 Each experiment's metrics are saved under `runs/ablations/<experiment_name>/` along with a summary plot and CSV in `runs/ablations/`.
 
+### Using the driver script for bulk experiments
+
+The `run_experiments.py` driver orchestrates multiple calls to `image_inpainting.py` with curated hyperparameters. By default it
+launches six experiments covering heteroscedastic/homoscedastic losses, rollout length, clipping, and beta schedules.
+
+1. **Choose an output directory** (default: `runs/`):
+   ```bash
+   python3 run_experiments.py --runs_dir runs/ablations
+   ```
+   This creates one subfolder per experiment (e.g. `runs/ablations/hetero_baseline/`). Logs, `metrics.json`, and intermediate
+   checkpoints are stored there.
+2. **Adjust the training budget** if desired with `--epochs` (default: 10). All runs share the same epoch count:
+   ```bash
+   python3 run_experiments.py --runs_dir runs/ablations --epochs 12
+   ```
+3. **Point to a custom script** with `--script` when extending the driver to new variants:
+   ```bash
+   python3 run_experiments.py --script drivers/run_all_inpainting.py
+   ```
+
+When the driver finishes, it aggregates results by saving
+
+- `compare_curves.png`: PSNR curves for each experiment plotted on the same axes.
+- `summary.csv`: a table containing final metrics, hyperparameters, and the full PSNR trajectory.
+- A textual summary printed to the console showing final PSNR values sorted from best to worst.
+
+Failed runs (missing `metrics.json`) are reported in the console log and excluded from the summary artifacts.
+
