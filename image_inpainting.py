@@ -14,6 +14,10 @@ import torchvision as tv
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
 
+from metrics import lpips_dist as _metric_lpips
+from metrics import psnr as _metric_psnr
+from metrics import ssim as _metric_ssim
+
 # -------------------------- Utilities --------------------------
 
 def set_seed(seed: int):
@@ -63,6 +67,31 @@ def tv_l1(x, weight=1.0):
     dy = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean()
     dx = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
     return weight*(dx + dy)
+
+
+def masked_psnr_metric(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.to(dtype=a.dtype)
+    mask_exp = mask.expand_as(a)
+    denom = mask_exp.sum().clamp_min(1e-8)
+    mse = ((a - b) * mask_exp).pow(2).sum() / denom
+    if mse <= 0:
+        return torch.tensor(99.0, device=a.device, dtype=a.dtype)
+    return 10.0 * torch.log10(4.0 / mse)
+
+
+def masked_metric_mean(metric_fn, a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.to(dtype=a.dtype)
+    mask_exp = mask.expand_as(a)
+    try:
+        vals = metric_fn(a * mask_exp, b * mask_exp, reduction="none")
+        frac = mask_exp.mean(dim=(1, 2, 3)).clamp_min(1e-6)
+        return (vals / frac).mean()
+    except TypeError:
+        val = metric_fn(a * mask_exp, b * mask_exp)
+        val_tensor = torch.as_tensor(val, device=a.device, dtype=a.dtype)
+        frac_scalar = mask.mean().clamp_min(1e-6)
+        scale = (1.0 / frac_scalar).to(device=val_tensor.device, dtype=val_tensor.dtype)
+        return val_tensor * scale
 
 def hetero_gauss_nll(pred, target, log_sigma):
     # Channel-wise Gaussian NLL; σ = softplus(exp(log_sigma)) to ensure positivity
@@ -292,6 +321,88 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
 
     return np.array(psnrs_step).mean(axis=0)  # mean PSNR per step
 
+
+@torch.no_grad()
+def evaluate_metrics_full(
+    controller,
+    loader,
+    device,
+    *,
+    K_eval: int,
+    beta: float,
+    p_missing=(0.25, 0.5),
+    block_prob=0.5,
+    noise_std=0.3,
+    corr_clip=0.2,
+    descent_guard: bool = True,
+    tvw: float = 0.0,
+    sigma_prior: float = 1e-4,
+    loss_mode: str = "hetero",
+    homo_sigma: float = 0.1,
+):
+    controller.eval()
+    totals = {
+        "psnr_all": 0.0,
+        "psnr_miss": 0.0,
+        "ssim_all": 0.0,
+        "ssim_miss": 0.0,
+        "lpips_all": 0.0,
+        "lpips_miss": 0.0,
+    }
+    batches = 0
+
+    for imgs, _ in loader:
+        imgs = imgs.to(device, non_blocking=True)
+        mask_known = random_mask(imgs, p_missing=p_missing, block_prob=block_prob).to(device)
+        corrupted = corrupt_images(imgs, mask_known, noise_std=noise_std)
+        I = clamp_known(corrupted.clone(), imgs, mask_known)
+
+        for step in range(K_eval):
+            clip_decay = 0.92 ** step
+            if descent_guard:
+                I, _, _, _, _ = nftm_step_guarded(
+                    I,
+                    imgs,
+                    mask_known,
+                    controller,
+                    beta=beta,
+                    corr_clip=corr_clip,
+                    tvw=tvw,
+                    max_backtracks=3,
+                    shrink=0.5,
+                    clip_decay=clip_decay,
+                    sigma_prior=sigma_prior,
+                    loss_mode=loss_mode,
+                    homo_sigma=homo_sigma,
+                )
+            else:
+                I, _ = nftm_step(
+                    I,
+                    imgs,
+                    mask_known,
+                    controller,
+                    beta=beta,
+                    corr_clip=corr_clip,
+                    clip_decay=clip_decay,
+                )
+
+        preds = I.clamp(-1.0, 1.0)
+        miss_mask = 1.0 - mask_known
+
+        totals["psnr_all"] += float(_metric_psnr(preds, imgs).item())
+        totals["psnr_miss"] += float(masked_psnr_metric(preds, imgs, miss_mask).item())
+        totals["ssim_all"] += float(_metric_ssim(preds, imgs).item())
+        totals["ssim_miss"] += float(masked_metric_mean(_metric_ssim, preds, imgs, miss_mask).item())
+        totals["lpips_all"] += float(_metric_lpips(preds, imgs).item())
+        totals["lpips_miss"] += float(masked_metric_mean(_metric_lpips, preds, imgs, miss_mask).item())
+        batches += 1
+
+    if batches == 0:
+        raise RuntimeError("Evaluation loader produced no batches for metric computation.")
+
+    return {key: totals[key] / batches for key in totals}
+
+
 def plot_psnr_curve(curve, save_path):
     ensure_dir(os.path.dirname(save_path) or ".")
     plt.figure(figsize=(6,4))
@@ -355,6 +466,7 @@ def main():
 
     # Model / Optim
     controller = TinyController(in_ch=4, width=args.width).to(device)
+    param_total = sum(p.numel() for p in controller.parameters() if p.requires_grad)
     opt = torch.optim.AdamW(controller.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     ensure_dir(args.save_dir)
@@ -396,9 +508,12 @@ def main():
     plot_psnr_curve(curve, os.path.join(args.save_dir, "psnr_curve.png"))
 
     # Save a final sample grid (progression of first test batch)
+    final_beta = min(args.beta_start + args.beta_anneal * (args.epochs-1), args.beta_max)
+    beta_eval_final = min(final_beta + args.beta_eval_bonus, 0.9)
+
     _ = eval_steps(
         controller, test_loader, device,
-        K_eval=min(args.K_eval, 10), beta=min(beta + args.beta_eval_bonus, 0.9),
+        K_eval=min(args.K_eval, 10), beta=beta_eval_final,
         p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
         noise_std=args.noise_std, corr_clip=args.corr_clip,
         descent_guard=True, tvw=0.0,
@@ -410,6 +525,22 @@ def main():
 
     # Save metrics for the driver / comparisons
     if args.save_metrics:
+        metrics_full = evaluate_metrics_full(
+            controller,
+            test_loader,
+            device,
+            K_eval=args.K_eval,
+            beta=beta_eval_final,
+            p_missing=(args.pmin, args.pmax),
+            block_prob=args.block_prob,
+            noise_std=args.noise_std,
+            corr_clip=args.corr_clip,
+            descent_guard=True,
+            tvw=0.0,
+            sigma_prior=1e-4,
+            loss_mode=args.loss,
+            homo_sigma=args.homo_sigma,
+        )
         np.save(os.path.join(args.save_dir, "psnr_curve.npy"), curve)
         summary = dict(
             loss_mode=args.loss,
@@ -428,6 +559,9 @@ def main():
             final_psnr=float(curve[-1]),
             curve=[float(x) for x in curve]
         )
+        summary.update(metrics_full)
+        summary["params"] = float(param_total)
+        summary["seed"] = int(args.seed)
         with open(os.path.join(args.save_dir, "metrics.json"), "w") as f:
             json.dump(summary, f, indent=2)
         print(f"[metrics] saved metrics.json & psnr_curve.npy in {args.save_dir}")
