@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Dict, Tuple
 
 import torch
+import torch.nn.functional as F
 
 try:  # Prefer pytorch-msssim when available.
     from pytorch_msssim import ssim as _msssim
@@ -24,13 +25,14 @@ except Exception:  # pragma: no cover - optional dependency
         _SSIM_BACKEND = "torchmetrics"
     except Exception:  # pragma: no cover - optional dependency
         _tm_ssim = None
-        _SSIM_BACKEND = None
+        _SSIM_BACKEND = "fallback"
 
 
 __all__ = ["psnr", "ssim", "lpips_dist", "param_count"]
 
 
 _LPIPS_CACHE: Dict[Tuple[str, str], torch.nn.Module] = {}
+_SSIM_KERNEL_CACHE: Dict[Tuple[int, float, torch.device, torch.dtype], torch.Tensor] = {}
 
 
 def _validate_inputs(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -74,21 +76,80 @@ def psnr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return psnr_value.to(device=device, dtype=torch.float32)
 
 
+def _get_gaussian_kernel(
+    window_size: int,
+    sigma: float,
+    channels: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a separable 2D Gaussian kernel expanded for ``channels`` groups."""
+
+    key = (window_size, sigma, device, dtype)
+    kernel = _SSIM_KERNEL_CACHE.get(key)
+    if kernel is not None:
+        return kernel
+
+    coords = torch.arange(window_size, device=device, dtype=dtype) - window_size // 2
+    gauss_1d = torch.exp(-(coords**2) / (2 * sigma * sigma))
+    gauss_1d = gauss_1d / gauss_1d.sum()
+    gauss_2d = gauss_1d[:, None] * gauss_1d[None, :]
+    gauss_2d = gauss_2d / gauss_2d.sum()
+    kernel = gauss_2d.expand(channels, 1, window_size, window_size).contiguous()
+    _SSIM_KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def _ssim_fallback(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Compute SSIM using a pure PyTorch implementation."""
+
+    channels = x.size(1)
+    height, width = x.size(2), x.size(3)
+    window_size = min(11, height, width)
+    if window_size % 2 == 0:
+        window_size -= 1
+    if window_size < 3:
+        window_size = 3
+    sigma = 1.5 * window_size / 11.0
+
+    kernel = _get_gaussian_kernel(
+        window_size, sigma, channels, device=x.device, dtype=x.dtype
+    )
+    padding = window_size // 2
+
+    mu_x = F.conv2d(x, kernel, padding=padding, groups=channels)
+    mu_y = F.conv2d(y, kernel, padding=padding, groups=channels)
+
+    mu_x_sq = mu_x * mu_x
+    mu_y_sq = mu_y * mu_y
+    mu_xy = mu_x * mu_y
+
+    sigma_x_sq = F.conv2d(x * x, kernel, padding=padding, groups=channels) - mu_x_sq
+    sigma_y_sq = F.conv2d(y * y, kernel, padding=padding, groups=channels) - mu_y_sq
+    sigma_xy = F.conv2d(x * y, kernel, padding=padding, groups=channels) - mu_xy
+
+    data_range = torch.tensor(2.0, dtype=x.dtype, device=x.device)
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+
+    numerator = (2 * mu_xy + c1) * (2 * sigma_xy + c2)
+    denominator = (mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2)
+    ssim_map = numerator / denominator
+    return ssim_map.mean()
+
+
 def ssim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Return the batch-mean SSIM for tensors in ``[-1, 1]``."""
-
-    if _SSIM_BACKEND is None:
-        raise RuntimeError(
-            "Neither pytorch-msssim nor torchmetrics with SSIM support is available."
-        )
 
     x32, y32 = _validate_inputs(x, y)
     device = x.device
 
     if _SSIM_BACKEND == "pytorch-msssim":
         ssim_val = _msssim(x32, y32, data_range=2.0, size_average=True, win_size=11)
-    else:
+    elif _SSIM_BACKEND == "torchmetrics":
         ssim_val = _tm_ssim(x32, y32, data_range=2.0, kernel_size=11)
+    else:
+        ssim_val = _ssim_fallback(x32, y32)
 
     if not isinstance(ssim_val, torch.Tensor):  # pragma: no cover - defensive
         ssim_val = torch.tensor(ssim_val, device=device, dtype=torch.float32)
