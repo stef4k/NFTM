@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 from metrics import lpips_dist as _metric_lpips
 from metrics import psnr as _metric_psnr
 from metrics import ssim as _metric_ssim
+from unet_model import TinyUNet
 
 # -------------------------- Utilities --------------------------
 
@@ -67,6 +68,10 @@ def tv_l1(x, weight=1.0):
     dy = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean()
     dx = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
     return weight*(dx + dy)
+
+
+def count_params(m):
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
 
 def masked_psnr_metric(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -136,6 +141,22 @@ class TinyController(nn.Module):
         dI   = self.head_dI(h).tanh()
         gate = torch.sigmoid(self.head_gate(h))
         logS = self.head_logS(h)
+        return dI, gate, logS
+
+
+class UNetController(nn.Module):
+    def __init__(self, in_ch=4, base=10):
+        super().__init__()
+        self.unet = TinyUNet(in_ch=in_ch, out_ch=7, base=base)
+        # For controller usage we need linear outputs; override the final activation.
+        self.unet.activation = nn.Identity()
+
+    def forward(self, I, M):
+        x = torch.cat([I, M], dim=1)
+        out = self.unet(x)
+        dI_raw, gate_raw, logS = torch.split(out, [3, 1, 3], dim=1)
+        dI = torch.tanh(dI_raw)
+        gate = torch.sigmoid(gate_raw)
         return dI, gate, logS
 
 def nftm_step(I, I_gt, M, controller, beta=0.5, corr_clip=0.2, clip_decay=1.0):
@@ -435,6 +456,9 @@ def main():
     parser.add_argument("--block_prob", type=float, default=0.5, help="probability to add random occlusion blocks")
     parser.add_argument("--noise_std", type=float, default=0.3, help="corruption noise std for missing pixels")
     parser.add_argument("--width", type=int, default=48, help="controller width")
+    parser.add_argument("--controller", type=str, default="dense", choices=["dense", "unet"],
+                        help="controller architecture")
+    parser.add_argument("--unet_base", type=int, default=10, help="base channels for UNet controller")
     parser.add_argument("--save_dir", type=str, default="out", help="directory to save plots/metrics")
     parser.add_argument("--save_epoch_progress", action="store_true", help="save per-epoch step grids for the first eval batch")
     parser.add_argument("--guard_in_train", action="store_true", help="enable descent guard during training (slower, more stable)")
@@ -465,8 +489,30 @@ def main():
                               pin_memory=use_cuda_pinning)
 
     # Model / Optim
-    controller = TinyController(in_ch=4, width=args.width).to(device)
-    param_total = sum(p.numel() for p in controller.parameters() if p.requires_grad)
+    controller_info = {"name": args.controller}
+    if args.controller == "dense":
+        controller = TinyController(in_ch=4, width=args.width).to(device)
+    else:
+        target = count_params(TinyController(in_ch=4, width=args.width))
+        base = args.unet_base
+        best = None
+        for b in range(6, 14):
+            tmp = UNetController(in_ch=4, base=b)
+            n = count_params(tmp)
+            if best is None or abs(n - target) < abs(best[1] - target):
+                best = (b, n)
+        if best is not None and abs(best[1] - target) <= 0.05 * target and best[0] != base:
+            print(f"[controller] auto-adjust unet_base {base} -> {best[0]} (target params={target})")
+            base = best[0]
+        controller = UNetController(in_ch=4, base=base).to(device)
+        controller_info["base"] = base
+    param_total = count_params(controller)
+    controller_info["params"] = param_total
+    info_msg = f"[controller] {controller_info['name']}"
+    if "base" in controller_info:
+        info_msg += f" | base={controller_info['base']}"
+    info_msg += f" | params={controller_info['params']}"
+    print(info_msg)
     opt = torch.optim.AdamW(controller.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     ensure_dir(args.save_dir)
@@ -500,7 +546,8 @@ def main():
 
         curve_str = ", ".join(f"{v:.2f}" for v in curve[:min(5, len(curve))])
         print(f"[ep {ep:02d}] β_train={beta:.3f} K_train={stats['train_K']} | loss {train_loss:.4f} | "
-              f"train PSNR {train_psnr:.2f} dB | eval PSNR 1..{args.K_eval}: {curve_str} ... {curve[-1]:.2f}")
+              f"train PSNR {train_psnr:.2f} dB | eval PSNR 1..{args.K_eval}: {curve_str} ... {curve[-1]:.2f} | "
+              f"ctrl={args.controller}")
         if args.guard_in_train:
             print(f"         accepted steps: {stats['accepted']} | backtracks (approx): {stats['backtracks']}")
 
@@ -521,7 +568,7 @@ def main():
         epoch_tag="final", sigma_prior=1e-4,
         loss_mode=args.loss, homo_sigma=args.homo_sigma
     )
-    print("[done] checkpoints and plots saved under:", args.save_dir)
+    print("[done] checkpoints and plots saved under:", args.save_dir, f"| controller={args.controller}")
 
     # Save metrics for the driver / comparisons
     if args.save_metrics:
@@ -562,9 +609,12 @@ def main():
         summary.update(metrics_full)
         summary["params"] = float(param_total)
         summary["seed"] = int(args.seed)
+        summary["controller"] = args.controller
+        if args.controller == "unet":
+            summary["unet_base"] = int(controller_info.get("base", args.unet_base))
         with open(os.path.join(args.save_dir, "metrics.json"), "w") as f:
             json.dump(summary, f, indent=2)
-        print(f"[metrics] saved metrics.json & psnr_curve.npy in {args.save_dir}")
+        print(f"[metrics] saved metrics.json & psnr_curve.npy in {args.save_dir} | controller={args.controller}")
 
 if __name__ == "__main__":
     main()
