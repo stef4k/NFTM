@@ -7,6 +7,8 @@ four-channel inputs (RGB plus mask) and produces RGB outputs in ``[-1, 1]`` via
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -88,7 +90,17 @@ class TinyUNet(nn.Module):
     def _init_weights(module: nn.Module) -> None:
         """Initialize convolution weights with Kaiming normal distribution."""
         if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
-            nn.init.kaiming_normal_(module.weight, mode="fan_in", nonlinearity="gelu")
+            # ``torch.nn.init.kaiming_normal_`` does not support ``gelu`` directly, but
+            # the recommended gain for GELU activations matches the ReLU gain
+            # (``sqrt(2)``).  We therefore fall back to an explicit normal
+            # initialisation using that gain.  This keeps the variance identical to
+            # what Kaiming initialisation would produce for GELU while avoiding the
+            # unsupported nonlinearity error raised by ``calculate_gain``.
+            fan = nn.init._calculate_correct_fan(module.weight, mode="fan_in")
+            gain = math.sqrt(2.0)
+            std = gain / math.sqrt(fan)
+            with torch.no_grad():
+                module.weight.normal_(0.0, std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
