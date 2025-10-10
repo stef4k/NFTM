@@ -139,9 +139,9 @@ except ImportError:  # Provide lightweight fallbacks if metrics module missing
 
 @dataclass
 class TVL1Params:
-    iters: int = 250
-    lam: float = 80.0
-    tvw: float = 0.10
+    iters: int = 400
+    lam: float = 40.0
+    tvw: float = 0.05
     tau_p: float = 0.25
     tau_d: float = 0.25
 
@@ -150,9 +150,9 @@ class TVL1Params:
 def tvl1_inpaint(
     I0: torch.Tensor,
     M: torch.Tensor,
-    iters: int = 250,
-    lam: float = 80.0,
-    tvw: float = 0.10,
+    iters: int = 400,
+    lam: float = 40.0,
+    tvw: float = 0.05,
     tau_p: float = 0.25,
     tau_d: float = 0.25,
 ) -> torch.Tensor:
@@ -193,10 +193,10 @@ def tvl1_inpaint(
         px[:, :, :, -1].zero_()
         py[:, :, -1, :].zero_()
 
-        sum_abs = px.abs() + py.abs()
-        scale = (sum_abs * tvw).clamp_min(1.0)
-        px.div_(scale)
-        py.div_(scale)
+        px = px / torch.clamp(px.abs() / tvw, min=1.0)
+        py = py / torch.clamp(py.abs() / tvw, min=1.0)
+        px[:, :, :, -1].zero_()
+        py[:, :, -1, :].zero_()
 
         div.zero_()
         div.add_(px)
@@ -205,7 +205,9 @@ def tvl1_inpaint(
         div[:, :, 1:, :].sub_(py[:, :, :-1, :])
 
         data_term = lam * mask_exp * (I - I0)
-        I.add_(div + data_term, alpha=-tau_p)
+        I.add_(div, alpha=tau_p)  # + τ div p
+        I.add_(data_term, alpha=-tau_p)  # − τ λ M (u − f)
+        I = clamp_known(I, I0, mask)
         I.clamp_(-1.0, 1.0)
 
     I = clamp_known(I, I0, mask)
@@ -232,14 +234,10 @@ def masked_metric_mean(
     mask_exp = mask.expand_as(a)
     try:
         vals = metric_fn(a * mask_exp, b * mask_exp, reduction="none")
-        frac = mask_exp.mean(dim=(1, 2, 3)).clamp_min(1e-6)
-        return (vals / frac).mean()
+        return vals.mean()
     except TypeError:
         val = metric_fn(a * mask_exp, b * mask_exp)
-        val_tensor = torch.as_tensor(val, device=a.device, dtype=a.dtype)
-        frac_scalar = mask.mean().clamp_min(1e-6)
-        scale = (1.0 / frac_scalar).to(device=val_tensor.device, dtype=val_tensor.dtype)
-        return val_tensor * scale
+        return torch.as_tensor(val, device=a.device, dtype=a.dtype)
 
 
 def run_eval(params: TVL1Params, args: argparse.Namespace) -> Dict[str, float]:
@@ -327,14 +325,18 @@ def run_eval(params: TVL1Params, args: argparse.Namespace) -> Dict[str, float]:
         metrics_sum[key] = metrics_sum[key] / max(batch_count, 1)
 
     metrics_sum["seed"] = args.seed
+    print(
+        f"[TVL1] mean PSNR_all={metrics_sum['psnr_all']:.2f} dB, "
+        f"PSNR_miss={metrics_sum['psnr_miss']:.2f} dB"
+    )
     return metrics_sum
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TV-L1 inpainting baseline")
-    parser.add_argument("--iters", type=int, default=250)
-    parser.add_argument("--lam", type=float, default=80.0)
-    parser.add_argument("--tvw", type=float, default=0.10)
+    parser.add_argument("--iters", type=int, default=400)
+    parser.add_argument("--lam", type=float, default=40.0)
+    parser.add_argument("--tvw", type=float, default=0.05)
     parser.add_argument("--tau_p", type=float, default=0.25)
     parser.add_argument("--tau_d", type=float, default=0.25)
     parser.add_argument("--batch_size", type=int, default=256)
