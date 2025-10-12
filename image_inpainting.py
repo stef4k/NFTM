@@ -17,6 +17,8 @@ import matplotlib.pyplot as plt
 from metrics import lpips_dist as _metric_lpips
 from metrics import psnr as _metric_psnr
 from metrics import ssim as _metric_ssim
+from metrics import (fid_init, fid_update, fid_compute,
+                     kid_init, kid_update, kid_compute)
 from unet_model import TinyUNet
 
 # -------------------------- Utilities --------------------------
@@ -371,6 +373,8 @@ def evaluate_metrics_full(
         "lpips_miss": 0.0,
     }
     batches = 0
+    fid_metric = fid_init(device)
+    kid_metric = kid_init(device)
 
     for imgs, _ in loader:
         imgs = imgs.to(device, non_blocking=True)
@@ -417,11 +421,20 @@ def evaluate_metrics_full(
         totals["lpips_all"] += float(_metric_lpips(preds, imgs).item())
         totals["lpips_miss"] += float(masked_metric_mean(_metric_lpips, preds, imgs, miss_mask).item())
         batches += 1
+        # Accumulate FID/KID features
+        fid_update(fid_metric, imgs, preds)
+        kid_update(kid_metric, imgs, preds)
+
 
     if batches == 0:
         raise RuntimeError("Evaluation loader produced no batches for metric computation.")
 
-    return {key: totals[key] / batches for key in totals}
+    results = {key: totals[key] / batches for key in totals}
+    # Compute final FID/KID scores over full test set
+    results["fid"] = fid_compute(fid_metric)
+    results["kid"] = kid_compute(kid_metric)
+
+    return results
 
 
 def plot_psnr_curve(curve, save_path):

@@ -11,6 +11,13 @@ from typing import Dict, Tuple
 import torch
 import torch.nn.functional as F
 
+try:
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    from torchmetrics.image.kid import KernelInceptionDistance
+    _FID_AVAILABLE = True
+except Exception:  # optional dependency
+    _FID_AVAILABLE = False
+
 try:  # Prefer pytorch-msssim when available.
     from pytorch_msssim import ssim as _msssim
 
@@ -28,9 +35,13 @@ except Exception:  # pragma: no cover - optional dependency
         _SSIM_BACKEND = "fallback"
 
 
-__all__ = ["psnr", "ssim", "lpips_dist", "param_count"]
+__all__ = ["psnr", "ssim", "lpips_dist", 
+           "fid_init", "fid_update", "fid_compute",
+            "kid_init", "kid_update", "kid_compute",
+            "param_count"]
 
-
+_FID_CACHE = {}
+_KID_CACHE = {}
 _LPIPS_CACHE: Dict[Tuple[str, str], torch.nn.Module] = {}
 _SSIM_KERNEL_CACHE: Dict[Tuple[int, float, torch.device, torch.dtype], torch.Tensor] = {}
 
@@ -192,6 +203,37 @@ def lpips_dist(x: torch.Tensor, y: torch.Tensor, net: str = "alex") -> torch.Ten
     dist = dist.to(device=device, dtype=torch.float32)
     return dist.mean()
 
+def fid_init(device: torch.device):
+    if not _FID_AVAILABLE:
+        raise RuntimeError("FID requires torchmetrics.")
+    metric = FrechetInceptionDistance(normalize=True).to(device)
+    return metric
+
+def fid_update(metric, x, y):
+    # expects [-1, 1]
+    x_in = (x + 1) / 2
+    y_in = (y + 1) / 2
+    metric.update(x_in, real=True)
+    metric.update(y_in, real=False)
+
+def fid_compute(metric):
+    return metric.compute().item()
+
+def kid_init(device: torch.device):
+    if not _FID_AVAILABLE:
+        raise RuntimeError("KID requires torchmetrics.")
+    metric = KernelInceptionDistance(normalize=True).to(device)
+    return metric
+
+def kid_update(metric, x, y):
+    x_in = (x + 1) / 2
+    y_in = (y + 1) / 2
+    metric.update(x_in, real=True)
+    metric.update(y_in, real=False)
+
+def kid_compute(metric):
+    # KID returns (mean, std)
+    return metric.compute()[0].item()
 
 def param_count(model) -> int:
     """Return the number of trainable parameters in ``model``."""
