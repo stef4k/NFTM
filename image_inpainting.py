@@ -186,7 +186,7 @@ def nftm_step_guarded(I, I_gt, M, controller, beta, corr_clip=0.2, tvw=0.01,
 
 def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 beta=0.4, tvw=0.01, p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
-                corr_clip=0.2, guard_in_train=False,
+                corr_clip=0.2, guard_in_train=True,
                 contract_w=1e-3, rollout_bias=True):
     controller.train()
     psnrs, losses = [], []
@@ -380,7 +380,7 @@ def evaluate_metrics_full(
     block_prob=0.5,
     noise_std=0.3,
     corr_clip=0.2,
-    descent_guard: bool = True,
+    descent_guard: bool = False,
     tvw: float = 0.0,
 ):
     controller.eval()
@@ -602,7 +602,7 @@ def main():
         K_eval=min(args.K_eval, 10), beta=beta_eval_final,
         p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
         noise_std=args.noise_std, corr_clip=args.corr_clip,
-        descent_guard=True, tvw=0.0,
+        descent_guard=False, tvw=0.0,
         save_per_epoch_dir=os.path.join(args.save_dir, "final"),
         epoch_tag="final"
     )
@@ -620,7 +620,7 @@ def main():
             block_prob=args.block_prob,
             noise_std=args.noise_std,
             corr_clip=args.corr_clip,
-            descent_guard=True,
+            descent_guard=False,
             tvw=0.0,
         )
         if psnr_curve is not None and psnr_curve.size > 0:
