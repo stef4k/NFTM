@@ -11,7 +11,7 @@ Usage examples:
     python heat_eq.py --mode variable --size 64 --epochs_a 300
 
     # Baseline comparison (NFTM vs CNN/UNet)
-    python heat_eq.py --mode baseline --size 32
+    python heat_eq.py --mode baseline --size 64
 
     # Test alpha identification routine
     python heat_eq.py --mode test_alpha --size 64
@@ -29,7 +29,12 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import numpy as np
+try:
+    import imageio
+except ImportError:
+    imageio = None
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -541,6 +546,35 @@ def train_phase_b(model, opt, mse, args, device, alpha_gt=None):
     return losses, psnrs
 
 
+def evaluate_variable_model(model, args, device, batches: int = 4) -> Tuple[float, float]:
+    """Evaluate variable-α model on synthetic sequences."""
+    model_was_training = model.training
+    model.eval()
+    mse = nn.MSELoss()
+    losses: List[float] = []
+    psnrs: List[float] = []
+
+    with torch.no_grad():
+        for _ in range(batches):
+            gt, _ = generate_variable_sequence(args.batch_size, args.size, args.size, args.timesteps, device)
+            f0 = gt[:, 0].unsqueeze(1)
+            heads_seq = [make_exact_grid_heads(args.batch_size, args.size, args.size, device)
+                         for _ in range(args.timesteps - 1)]
+            fields = model(f0, heads_seq)
+            pred = torch.stack(fields, 1).squeeze(2)
+
+            loss = mse(pred, gt)
+            losses.append(loss.item())
+
+            psnr = -10.0 * torch.log10(((pred - gt) ** 2).mean()).item()
+            psnrs.append(psnr)
+
+    if model_was_training:
+        model.train()
+
+    return float(np.mean(losses)), float(np.mean(psnrs))
+
+
 def train_baseline(model, opt, mse, args, device):
     """Train baseline models."""
     losses = []
@@ -688,13 +722,15 @@ def compare_baselines(args, device):
         # Train/evaluate
         start_time = time.time()
 
+        eval_T = args.eval_timesteps or args.timesteps
+
         if name == 'NFTM-Fixed':
             # No training needed; evaluate the fixed-physics rollout directly
             with torch.no_grad():
-                gt, _ = generate_variable_sequence(1, args.size, args.size, args.timesteps, device)
+                gt, _ = generate_variable_sequence(1, args.size, args.size, eval_T, device)
                 f0 = gt[:, 0].unsqueeze(1)
                 heads_seq = [make_exact_grid_heads(1, args.size, args.size, device)
-                             for _ in range(args.timesteps - 1)]
+                             for _ in range(eval_T - 1)]
                 fields = model(f0, heads_seq)
                 pred = torch.stack(fields, 1).squeeze(2)
                 final_psnr = -10.0 * torch.log10(((pred - gt) ** 2).mean()).item()
@@ -705,9 +741,9 @@ def compare_baselines(args, device):
                 train_time = time.time() - start_time
                 # Evaluate PSNR after time-boxed training
                 with torch.no_grad():
-                    gt, _ = generate_variable_sequence(1, args.size, args.size, args.timesteps, device)
+                    gt, _ = generate_variable_sequence(1, args.size, args.size, eval_T, device)
                     f0 = gt[:, 0].unsqueeze(1)
-                    heads_seq = [make_exact_grid_heads(1, args.size, args.size, device) for _ in range(args.timesteps - 1)]
+                    heads_seq = [make_exact_grid_heads(1, args.size, args.size, device) for _ in range(eval_T - 1)]
                     fields = model(f0, heads_seq)
                     pred = torch.stack(fields, 1).squeeze(2)
                     final_psnr = -10.0 * torch.log10(((pred - gt) ** 2).mean()).item()
@@ -717,6 +753,15 @@ def compare_baselines(args, device):
                 _, psnrs = train_phase_b(model, opt, mse, args, device, alpha_gt=None)
                 final_psnr = psnrs[-1] if psnrs else 0
                 train_time = time.time() - start_time
+                # Optional evaluation on extended horizon
+                if args.eval_timesteps:
+                    with torch.no_grad():
+                        gt, _ = generate_variable_sequence(1, args.size, args.size, eval_T, device)
+                        f0 = gt[:, 0].unsqueeze(1)
+                        heads_seq = [make_exact_grid_heads(1, args.size, args.size, device) for _ in range(eval_T - 1)]
+                        fields = model(f0, heads_seq)
+                        pred = torch.stack(fields, 1).squeeze(2)
+                        final_psnr = -10.0 * torch.log10(((pred - gt) ** 2).mean()).item()
         else:
             if getattr(args, 'time_budget_s', 0.0) > 0.0:
                 train_baseline_timeboxed(model, opt, mse, args, device, args.time_budget_s)
@@ -727,8 +772,8 @@ def compare_baselines(args, device):
                 train_time = time.time() - start_time
             # Evaluate final PSNR
             with torch.no_grad():
-                gt, _ = generate_variable_sequence(1, args.size, args.size, args.timesteps, device)
-                pred = model.rollout(gt[:, 0].unsqueeze(1), args.timesteps).squeeze(2)
+                gt, _ = generate_variable_sequence(1, args.size, args.size, eval_T, device)
+                pred = model.rollout(gt[:, 0].unsqueeze(1), eval_T).squeeze(2)
                 final_psnr = -10.0 * torch.log10(((pred - gt) ** 2).mean()).item()
         
         # Test inference speed
@@ -943,6 +988,55 @@ def test_learnable_alpha(args, device):
     return learned_alphas
 
 
+def save_heat_animation(gt_tensor: torch.Tensor, pred_tensor: torch.Tensor, args, output_dir: Path, fps: int = 4) -> None:
+    """Save a short GIF comparing ground-truth and predicted heat fields over time."""
+    if imageio is None:
+        print("Warning: imageio not available; skipping GIF generation.")
+        return
+
+    try:
+        gif_path = output_dir / f'heat_evolution_{args.size}.gif'
+        gt_np = gt_tensor.detach().cpu().numpy()
+        pred_np = pred_tensor.detach().cpu().numpy()
+
+        if gt_np.shape[0] == 0 or pred_np.shape[0] == 0:
+            print("Warning: No frames available for animation; skipping GIF generation.")
+            return
+
+        frames: List[np.ndarray] = []
+        vmin, vmax = 0.0, 1.0
+
+        for t in range(gt_np.shape[1]):
+            fig, axes = plt.subplots(1, 2, figsize=(6, 3), dpi=120)
+            fig.suptitle(f'Timestep {t}', fontsize=10)
+            canvas = FigureCanvas(fig)
+
+            axes[0].imshow(gt_np[0, t], cmap='hot', vmin=vmin, vmax=vmax)
+            axes[0].set_title('Ground Truth')
+            axes[0].axis('off')
+
+            axes[1].imshow(pred_np[0, t], cmap='hot', vmin=vmin, vmax=vmax)
+            axes[1].set_title('Prediction')
+            axes[1].axis('off')
+
+            fig.tight_layout()
+            canvas.draw()
+            width, height = canvas.get_width_height()
+            frame = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
+            frame = frame.reshape((height, width, 4))[..., :3]
+            frames.append(frame)
+            plt.close(fig)
+
+        if frames:
+            imageio.mimsave(gif_path, frames, fps=fps)
+            print(f"Saved heat evolution animation to {gif_path}")
+        else:
+            print("Warning: No frames rendered; skipping GIF generation.")
+
+    except Exception as exc:
+        print(f"Warning: failed to save heat animation: {exc}")
+
+
 def visualize_results(model, args, device, mode_name=''):
     """Create comprehensive visualization."""
     print("\n=== Generating Visualizations ===")
@@ -1048,6 +1142,11 @@ def visualize_results(model, args, device, mode_name=''):
     
     print(f"PSNR per timestep: {' '.join([f'{p:.1f}' for p in psnr_per_t])}")
     
+    if args.mode == 'variable':
+        output_dir = Path(f'results_{args.mode}_{args.size}')
+        output_dir.mkdir(exist_ok=True)
+        save_heat_animation(gt, pred, args, output_dir)
+
     return psnr_per_t
 
 
@@ -1160,17 +1259,23 @@ def main():
         print("\nPhase A: Teacher-forced training")
         losses_a = train_phase_a(model, opt, mse, args, device)
 
-        # Phase B and visualization: use eval_timesteps if set and mode==variable
-        if args.mode == 'variable' and args.eval_timesteps is not None:
+        # Phase B (train on requested training horizon)
+        print("\nPhase B: Rollout training")
+        losses_b, psnrs = train_phase_b(model, opt, mse, args, device)
+
+        # Prepare evaluation args (optionally longer horizon)
+        if args.eval_timesteps is not None and args.eval_timesteps > 0:
             eval_args = argparse.Namespace(**vars(args))
             eval_args.timesteps = args.eval_timesteps
-            print(f"\nPhase B: Rollout training (eval horizon: {eval_args.timesteps})")
-            losses_b, psnrs = train_phase_b(model, opt, mse, eval_args, device)
-            visualize_results(model, eval_args, device, mode_name)
+            print(f"\nEvaluating on extended horizon: {eval_args.timesteps} steps")
         else:
-            print("\nPhase B: Rollout training")
-            losses_b, psnrs = train_phase_b(model, opt, mse, args, device)
-            visualize_results(model, args, device, mode_name)
+            eval_args = args
+
+        visualize_results(model, eval_args, device, mode_name)
+
+        if args.mode == 'variable':
+            eval_loss, eval_psnr = evaluate_variable_model(model, eval_args, device)
+            print(f"Evaluation rollout MSE: {eval_loss:.6f}, PSNR: {eval_psnr:.3f} dB")
 
         # Save model
         torch.save(model.state_dict(), output_dir / f'model_{args.mode}.pt')

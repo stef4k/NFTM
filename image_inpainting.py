@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # image_inpainting.py
 # NFTM-style iterative inpainting on CIFAR-10 with:
-# - heteroscedastic OR homoscedastic data loss (switchable)
+# - MSE data loss
 # - random rollouts + curriculum
 # - descent guard (backtracking) at eval (optional at train)
 # - damping (beta), per-step clip decay, contractive penalty
 # - rich logging + saved plots + metrics.json
 
-import os, math, random, argparse, json, numpy as np
+import os, random, argparse, json, numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torchvision as tv
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
+try:
+    import imageio.v2 as imageio
+except Exception:  # pragma: no cover - optional dependency guard
+    imageio = None
 
 from metrics import lpips_dist as _metric_lpips
 from metrics import psnr as _metric_psnr
@@ -79,8 +83,6 @@ def masked_psnr_metric(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> 
     mask_exp = mask.expand_as(a)
     denom = mask_exp.sum().clamp_min(1e-8)
     mse = ((a - b) * mask_exp).pow(2).sum() / denom
-    if mse <= 0:
-        return torch.tensor(99.0, device=a.device, dtype=a.dtype)
     return 10.0 * torch.log10(4.0 / mse)
 
 
@@ -98,17 +100,6 @@ def masked_metric_mean(metric_fn, a: torch.Tensor, b: torch.Tensor, mask: torch.
         scale = (1.0 / frac_scalar).to(device=val_tensor.device, dtype=val_tensor.dtype)
         return val_tensor * scale
 
-def hetero_gauss_nll(pred, target, log_sigma):
-    # Channel-wise Gaussian NLL; σ = softplus(exp(log_sigma)) to ensure positivity
-    sigma = F.softplus(log_sigma) + 1e-3
-    err = pred - target
-    nll = 0.5*((err / sigma)**2 + 2*torch.log(sigma))
-    return nll.mean(), sigma
-
-def homoscedastic_loss(pred, target, sigma_const=0.1):
-    # Gaussian NLL with fixed sigma (no predicted uncertainty)
-    err = pred - target
-    return 0.5 * ((err / sigma_const) ** 2 + 2 * math.log(sigma_const)).mean()
 
 def ensure_dir(path: str):
     if path:
@@ -122,8 +113,9 @@ class TinyController(nn.Module):
     Outputs:
       - dI: per-pixel correction (3ch), tanh-clamped
       - gate: per-pixel gate in (0,1) (1ch)
-      - log_sigma: per-pixel per-channel noise log-std (3ch) [used only if hetero loss]
+      - log_sigma: per-pixel per-channel log-std (3ch) (kept for compatibility)
     """
+
     def __init__(self, in_ch=4, width=48):
         super().__init__()
         self.body = nn.Sequential(
@@ -169,29 +161,21 @@ def nftm_step(I, I_gt, M, controller, beta=0.5, corr_clip=0.2, clip_decay=1.0):
 
 # -------------------------- Energy & Guard --------------------------
 
-def energy(I, I_gt, logS, tvw=0.01, sigma_prior=1e-4, loss_mode="hetero", homo_sigma=0.1):
-    if loss_mode == "hetero":
-        nll, sigma = hetero_gauss_nll(I, I_gt, logS)
-        prior = sigma_prior * (torch.log(sigma + 1e-8)).pow(2).mean()
-        data_term = nll + prior
-    else:
-        data_term = homoscedastic_loss(I, I_gt, sigma_const=homo_sigma)
+def energy(I, I_gt, tvw=0.01):
+    data_term = F.mse_loss(I, I_gt)
     return data_term + tv_l1(I, tvw)
 
 def nftm_step_guarded(I, I_gt, M, controller, beta, corr_clip=0.2, tvw=0.01,
-                      max_backtracks=3, shrink=0.5, clip_decay=1.0,
-                      sigma_prior=1e-4, loss_mode="hetero", homo_sigma=0.1):
+                      max_backtracks=3, shrink=0.5, clip_decay=1.0):
     """Try a step; if energy ↑, shrink beta and retry."""
     with torch.no_grad():
-        E0 = energy(I, I_gt, torch.zeros_like(I), tvw=tvw,
-                    sigma_prior=sigma_prior, loss_mode=loss_mode, homo_sigma=homo_sigma)
+        E0 = energy(I, I_gt, tvw=tvw)
     cur_beta = beta
     for _ in range(max_backtracks+1):
         I_prop, logS = nftm_step(I, I_gt, M, controller, beta=cur_beta,
                                  corr_clip=corr_clip, clip_decay=clip_decay)
         with torch.no_grad():
-            E1 = energy(I_prop, I_gt, logS, tvw=tvw,
-                        sigma_prior=sigma_prior, loss_mode=loss_mode, homo_sigma=homo_sigma)
+            E1 = energy(I_prop, I_gt, tvw=tvw)
         if E1 <= E0:
             return I_prop, logS, cur_beta, True, float(E1 - E0)
         cur_beta *= shrink
@@ -202,9 +186,8 @@ def nftm_step_guarded(I, I_gt, M, controller, beta, corr_clip=0.2, tvw=0.01,
 
 def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 beta=0.4, tvw=0.01, p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
-                corr_clip=0.2, guard_in_train=False, sigma_prior=1e-4,
-                contract_w=1e-3, rollout_bias=True,
-                loss_mode="hetero", homo_sigma=0.1):
+                corr_clip=0.2, guard_in_train=False,
+                contract_w=1e-3, rollout_bias=True):
     controller.train()
     psnrs, losses = [], []
     accepted_steps, backtracks = 0, 0
@@ -227,38 +210,29 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
         else:
             t = random.randint(1, K_train)
 
-        logS_last = torch.zeros_like(imgs[:, :3, ...], device=device)
         I_prev_for_contract = I.clone().detach()
 
         for s in range(t):
             clip_decay = (0.92 ** s)  # slightly tighter clipping at later steps
             if guard_in_train:
-                I, logS_last, used_beta, ok, dE = nftm_step_guarded(
+                I, _, _used_beta, ok, _dE = nftm_step_guarded(
                     I, imgs, M, controller, beta=beta, corr_clip=corr_clip,
-                    tvw=0.0, max_backtracks=2, shrink=0.5, clip_decay=clip_decay,
-                    sigma_prior=sigma_prior, loss_mode=loss_mode, homo_sigma=homo_sigma
+                    tvw=0.0, max_backtracks=2, shrink=0.5, clip_decay=clip_decay
                 )
                 accepted_steps += int(ok)
                 backtracks += int(not ok)
             else:
-                I, logS_last = nftm_step(I, imgs, M, controller, beta=beta,
-                                         corr_clip=corr_clip, clip_decay=clip_decay)
+                I, _ = nftm_step(I, imgs, M, controller, beta=beta,
+                                 corr_clip=corr_clip, clip_decay=clip_decay)
 
         # Data loss
-        if loss_mode == "hetero":
-            nll, sigma = hetero_gauss_nll(I, imgs, logS_last)
-            data_loss = nll
-            sigma_reg = 1e-4 * (torch.log(F.softplus(logS_last)+1e-3 + 1e-8)).pow(2).mean()
-        else:
-            sigma = None
-            data_loss = homoscedastic_loss(I, imgs, sigma_const=homo_sigma)
-            sigma_reg = 0.0
+        data_loss = F.mse_loss(I, imgs)
 
         # Regularizers
         loss_smooth = tv_l1(I, tvw)
         contract = contract_w * (I - I_prev_for_contract).pow(2).mean()
 
-        loss = data_loss + loss_smooth + contract + sigma_reg
+        loss = data_loss + loss_smooth + contract
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -276,10 +250,9 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
 def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
                p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
                corr_clip=0.2, descent_guard=False, tvw=0.0,
-               save_per_epoch_dir=None, epoch_tag=None, sigma_prior=1e-4,
-               loss_mode="hetero", homo_sigma=0.1):
+               save_per_epoch_dir=None, epoch_tag=None):
     controller.eval()
-    psnrs_step = []
+    psnrs_step, ssims_step, lpips_step = [], [], []
     # optional per-epoch visualization of first batch progression
     save_seq = (save_per_epoch_dir is not None)
     if save_seq:
@@ -290,47 +263,88 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
         M = random_mask(imgs, p_missing=p_missing, block_prob=block_prob).to(device)
         I0 = corrupt_images(imgs, M, noise_std=noise_std)
         I = clamp_known(I0.clone(), imgs, M)
-        step_psnrs = []
+        step_psnrs, step_ssims, step_lpips = [], [], []
+
+        gif_frames = []
+        make_gif_frame = None
 
         if save_seq and bidx == 0:
             vis_rows = min(6, imgs.size(0))
             cols = K_eval + 2
             plt.figure(figsize=(3*cols, 3*vis_rows))
-            def show_img(ax, x):
-                ax.imshow(((x.permute(1,2,0).cpu().numpy()+1)/2).clip(0,1))
+
+            def show_img(ax, x_tensor):
+                upsampled = F.interpolate(
+                    x_tensor.unsqueeze(0),
+                    scale_factor=2,
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(0)
+                ax.imshow(((upsampled.permute(1, 2, 0).cpu().numpy()+1)/2).clip(0,1))
                 ax.axis('off')
+
+            gif_cols = min(4, imgs.size(0))
+            gif_cols = max(gif_cols, 1)
+            gif_gt = imgs[:gif_cols].detach()
+
+            def make_gif_frame(batch):
+                if imageio is None:
+                    return None
+                current = batch[:gif_cols].detach().clamp(-1.0, 1.0)
+                gt = gif_gt.clamp(-1.0, 1.0)
+                up_gt = F.interpolate(gt, scale_factor=2, mode='bilinear', align_corners=False)
+                up_cur = F.interpolate(current, scale_factor=2, mode='bilinear', align_corners=False)
+                panel = torch.cat([up_gt, up_cur], dim=0)
+                panel = ((panel + 1.0) * 0.5).clamp(0.0, 1.0)
+                grid = tv.utils.make_grid(panel, nrow=gif_cols, padding=2, pad_value=0.0)
+                return (grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
             for r in range(vis_rows):
                 ax = plt.subplot(vis_rows, cols, r*cols+1)
-                show_img(ax, imgs[r]); 
-                if r==0: ax.set_title("GT")
+                show_img(ax, imgs[r])
+                if r == 0:
+                    ax.set_title("GT")
                 ax = plt.subplot(vis_rows, cols, r*cols+2)
-                show_img(ax, I[r]); 
-                if r==0: ax.set_title("Init")
+                show_img(ax, I[r])
+                if r == 0:
+                    ax.set_title("Init")
+
+            if imageio is not None:
+                init_frame = make_gif_frame(I.clamp(-1.0, 1.0))
+                if init_frame is not None:
+                    gif_frames.append(init_frame)
 
         for s in range(K_eval):
             clip_decay = (0.92 ** s)
             if descent_guard:
-                I, _, used_beta, ok, dE = nftm_step_guarded(
+                I, _, _used_beta, ok, _dE = nftm_step_guarded(
                     I, imgs, M, controller, beta=beta, corr_clip=corr_clip,
                     tvw=tvw, max_backtracks=3, shrink=0.5,
-                    clip_decay=clip_decay, sigma_prior=sigma_prior,
-                    loss_mode=loss_mode, homo_sigma=homo_sigma
+                    clip_decay=clip_decay
                 )
             else:
                 I, _ = nftm_step(I, imgs, M, controller, beta=beta,
                                  corr_clip=corr_clip, clip_decay=clip_decay)
-            step_psnrs.append(psnr(I, imgs).item())
+            I_metrics = I.clamp(-1.0, 1.0)
+            step_psnrs.append(_metric_psnr(I_metrics, imgs).item())
+            step_ssims.append(_metric_ssim(I_metrics, imgs).item())
+            step_lpips.append(_metric_lpips(I_metrics, imgs).item())
+            if save_seq and bidx == 0 and imageio is not None and make_gif_frame is not None:
+                frame = make_gif_frame(I_metrics)
+                if frame is not None:
+                    gif_frames.append(frame)
 
             if save_seq and bidx == 0:
                 vis_rows = min(6, imgs.size(0))
                 cols = K_eval + 2
                 for r in range(vis_rows):
                     ax = plt.subplot(vis_rows, cols, r*cols + (s+3))
-                    ax.imshow(((I[r].permute(1,2,0).cpu().numpy()+1)/2).clip(0,1))
-                    ax.axis('off')
+                    show_img(ax, I[r])
                     if r==0: ax.set_title(f"step {s+1}")
 
         psnrs_step.append(step_psnrs)
+        ssims_step.append(step_ssims)
+        lpips_step.append(step_lpips)
 
         if save_seq and bidx == 0:
             plt.tight_layout()
@@ -339,8 +353,19 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
             plt.savefig(out_path, dpi=140)
             print(f"[viz] saved per-epoch progression → {out_path}")
             plt.close()
+            if imageio is not None and gif_frames:
+                gif_path = os.path.join(save_per_epoch_dir, f"progress_{tag}.gif")
+                imageio.mimsave(gif_path, gif_frames, duration=0.4)
+                print(f"[gif] saved reconstruction GIF (GT top row, recon bottom) → {gif_path}")
+            elif imageio is None:
+                print("[gif] skipped GIF generation (imageio not installed)")
 
-    return np.array(psnrs_step).mean(axis=0)  # mean PSNR per step
+    curves = {
+        "psnr": np.array(psnrs_step).mean(axis=0) if psnrs_step else np.array([]),
+        "ssim": np.array(ssims_step).mean(axis=0) if ssims_step else np.array([]),
+        "lpips": np.array(lpips_step).mean(axis=0) if lpips_step else np.array([]),
+    }
+    return curves
 
 
 @torch.no_grad()
@@ -357,9 +382,6 @@ def evaluate_metrics_full(
     corr_clip=0.2,
     descent_guard: bool = True,
     tvw: float = 0.0,
-    sigma_prior: float = 1e-4,
-    loss_mode: str = "hetero",
-    homo_sigma: float = 0.1,
 ):
     controller.eval()
     totals = {
@@ -392,9 +414,6 @@ def evaluate_metrics_full(
                     max_backtracks=3,
                     shrink=0.5,
                     clip_decay=clip_decay,
-                    sigma_prior=sigma_prior,
-                    loss_mode=loss_mode,
-                    homo_sigma=homo_sigma,
                 )
             else:
                 I, _ = nftm_step(
@@ -424,15 +443,15 @@ def evaluate_metrics_full(
     return {key: totals[key] / batches for key in totals}
 
 
-def plot_psnr_curve(curve, save_path):
+def plot_metric_curve(curve, save_path, ylabel, title):
     ensure_dir(os.path.dirname(save_path) or ".")
     plt.figure(figsize=(6,4))
     plt.plot(range(1, len(curve)+1), curve, marker='o')
-    plt.xlabel("NFTM step"); plt.ylabel("PSNR (dB)")
-    plt.title("Step-wise PSNR (eval)")
+    plt.xlabel("NFTM step"); plt.ylabel(ylabel)
+    plt.title(title)
     plt.grid(True, alpha=0.3)
     plt.savefig(save_path, dpi=160)
-    print(f"[plot] saved PSNR curve → {save_path}")
+    print(f"[plot] saved {title.lower()} → {save_path}")
     plt.close()
 
 # -------------------------- Main --------------------------
@@ -466,16 +485,13 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
-    # NEW: loss mode switches + metrics dump
-    parser.add_argument("--loss", type=str, default="hetero", choices=["hetero","homo"])
-    parser.add_argument("--homo_sigma", type=float, default=0.1, help="σ for homoscedastic loss")
     parser.add_argument("--save_metrics", action="store_true", help="save metrics.json + psnr_curve.npy to save_dir")
 
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = torch.device(args.device)
-    print(f"[device] {device} | loss_mode={args.loss} | homo_sigma={args.homo_sigma if args.loss=='homo' else 'n/a'}")
+    print(f"[device] {device} | criterion=MSE")
 
     # Data
     transform = make_transforms()
@@ -519,6 +535,10 @@ def main():
     steps_dir = os.path.join(args.save_dir, "steps") if args.save_epoch_progress else None
     if steps_dir: ensure_dir(steps_dir)
 
+    psnr_curve = None
+    ssim_curve = None
+    lpips_curve = None
+
     # Train
     for ep in range(1, args.epochs+1):
         beta = min(args.beta_start + args.beta_anneal * (ep-1), args.beta_max)
@@ -529,30 +549,49 @@ def main():
             K_target=args.K_train, K_base=4, beta=beta, tvw=args.tv_weight,
             p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
             noise_std=args.noise_std, corr_clip=args.corr_clip,
-            guard_in_train=args.guard_in_train, sigma_prior=1e-4,
-            contract_w=args.contract_w, rollout_bias=True,
-            loss_mode=args.loss, homo_sigma=args.homo_sigma
+            guard_in_train=args.guard_in_train,
+            contract_w=args.contract_w, rollout_bias=True
         )
 
-        curve = eval_steps(
+        curves = eval_steps(
             controller, test_loader, device,
             K_eval=args.K_eval, beta=beta_eval,
             p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
             noise_std=args.noise_std, corr_clip=args.corr_clip,
             descent_guard=False, tvw=0.0,
-            save_per_epoch_dir=steps_dir, epoch_tag=ep, sigma_prior=1e-4,
-            loss_mode=args.loss, homo_sigma=args.homo_sigma
+            save_per_epoch_dir=steps_dir, epoch_tag=ep
         )
 
-        curve_str = ", ".join(f"{v:.2f}" for v in curve[:min(5, len(curve))])
-        print(f"[ep {ep:02d}] β_train={beta:.3f} K_train={stats['train_K']} | loss {train_loss:.4f} | "
-              f"train PSNR {train_psnr:.2f} dB | eval PSNR 1..{args.K_eval}: {curve_str} ... {curve[-1]:.2f} | "
-              f"ctrl={args.controller}")
+        psnr_curve = curves["psnr"]
+        ssim_curve = curves["ssim"]
+        lpips_curve = curves["lpips"]
+
+        if psnr_curve.size > 0:
+            head = psnr_curve[:min(5, len(psnr_curve))]
+            curve_str = ", ".join(f"{v:.2f}" for v in head)
+            tail_val = f"{psnr_curve[-1]:.2f}"
+        else:
+            curve_str = "n/a"
+            tail_val = "n/a"
+        msg = (f"[ep {ep:02d}] β_train={beta:.3f} K_train={stats['train_K']} | loss {train_loss:.4f} | "
+               f"train PSNR {train_psnr:.2f} dB | eval PSNR 1..{args.K_eval}: {curve_str} ... {tail_val} | "
+               f"ctrl={args.controller}")
+        if ssim_curve.size > 0 and lpips_curve.size > 0:
+            msg += (f" | final SSIM {ssim_curve[-1]:.4f} | final LPIPS {lpips_curve[-1]:.4f}")
+        print(msg)
         if args.guard_in_train:
             print(f"         accepted steps: {stats['accepted']} | backtracks (approx): {stats['backtracks']}")
 
-    # Save final PSNR curve
-    plot_psnr_curve(curve, os.path.join(args.save_dir, "psnr_curve.png"))
+    # Save final metric curves
+    if psnr_curve is not None and psnr_curve.size > 0:
+        plot_metric_curve(psnr_curve, os.path.join(args.save_dir, "psnr_curve.png"),
+                          "PSNR (dB)", "Step-wise PSNR (eval)")
+    if ssim_curve is not None and ssim_curve.size > 0:
+        plot_metric_curve(ssim_curve, os.path.join(args.save_dir, "ssim_curve.png"),
+                          "SSIM", "Step-wise SSIM (eval)")
+    if lpips_curve is not None and lpips_curve.size > 0:
+        plot_metric_curve(lpips_curve, os.path.join(args.save_dir, "lpips_curve.png"),
+                          "LPIPS", "Step-wise LPIPS (eval)")
 
     # Save a final sample grid (progression of first test batch)
     final_beta = min(args.beta_start + args.beta_anneal * (args.epochs-1), args.beta_max)
@@ -565,8 +604,7 @@ def main():
         noise_std=args.noise_std, corr_clip=args.corr_clip,
         descent_guard=True, tvw=0.0,
         save_per_epoch_dir=os.path.join(args.save_dir, "final"),
-        epoch_tag="final", sigma_prior=1e-4,
-        loss_mode=args.loss, homo_sigma=args.homo_sigma
+        epoch_tag="final"
     )
     print("[done] checkpoints and plots saved under:", args.save_dir, f"| controller={args.controller}")
 
@@ -584,14 +622,14 @@ def main():
             corr_clip=args.corr_clip,
             descent_guard=True,
             tvw=0.0,
-            sigma_prior=1e-4,
-            loss_mode=args.loss,
-            homo_sigma=args.homo_sigma,
         )
-        np.save(os.path.join(args.save_dir, "psnr_curve.npy"), curve)
+        if psnr_curve is not None and psnr_curve.size > 0:
+            np.save(os.path.join(args.save_dir, "psnr_curve.npy"), psnr_curve)
+        if ssim_curve is not None and ssim_curve.size > 0:
+            np.save(os.path.join(args.save_dir, "ssim_curve.npy"), ssim_curve)
+        if lpips_curve is not None and lpips_curve.size > 0:
+            np.save(os.path.join(args.save_dir, "lpips_curve.npy"), lpips_curve)
         summary = dict(
-            loss_mode=args.loss,
-            homo_sigma=args.homo_sigma,
             epochs=args.epochs,
             K_train=args.K_train,
             K_eval=args.K_eval,
@@ -603,9 +641,17 @@ def main():
             tv_weight=args.tv_weight,
             pmin=args.pmin, pmax=args.pmax, block_prob=args.block_prob,
             noise_std=args.noise_std,
-            final_psnr=float(curve[-1]),
-            curve=[float(x) for x in curve]
+            final_psnr=float(psnr_curve[-1]) if psnr_curve is not None and psnr_curve.size > 0 else None,
         )
+        if ssim_curve is not None and ssim_curve.size > 0:
+            summary["final_ssim"] = float(ssim_curve[-1])
+        if lpips_curve is not None and lpips_curve.size > 0:
+            summary["final_lpips"] = float(lpips_curve[-1])
+        summary["curve"] = [float(x) for x in psnr_curve] if psnr_curve is not None and psnr_curve.size > 0 else []
+        if ssim_curve is not None and ssim_curve.size > 0:
+            summary["curve_ssim"] = [float(x) for x in ssim_curve]
+        if lpips_curve is not None and lpips_curve.size > 0:
+            summary["curve_lpips"] = [float(x) for x in lpips_curve]
         summary.update(metrics_full)
         summary["params"] = float(param_total)
         summary["seed"] = int(args.seed)
