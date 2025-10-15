@@ -5,38 +5,39 @@ Comprehensive script for ML4PS workshop experiments with command-line interface.
 
 Usage examples:
     # Basic training with learnable alpha
-    python nftm_heat.py --mode learnable_alpha --size 64
-    
-    # Variable coefficient experiment
-    python nftm_heat.py --mode variable --size 64 --epochs_a 300
-    
-    # Baseline comparison
-    python nftm_heat.py --mode baseline --size 32
-    
-    # Long rollout stability test
-    python nftm_heat.py --mode stability --size 64 --rollout_steps 50
-    
-    # Super-resolution demo
-    python nftm_heat.py --mode super_res --train_size 32 --test_size 128
-    
-    # Source term physics
-    python nftm_heat.py --mode source --size 64
-    
-    # Generate all results for paper
-    python nftm_heat.py --mode all --size 64
+    python heat_eq.py --mode learnable_alpha --size 64
+
+    # Variable coefficient experiment (spatially varying alpha)
+    python heat_eq.py --mode variable --size 64 --epochs_a 300
+
+    # Baseline comparison (NFTM vs CNN/UNet)
+    python heat_eq.py --mode baseline --size 64
+
+    # Test alpha identification routine
+    python heat_eq.py --mode test_alpha --size 64
+
+    # Run all primary experiments
+    python heat_eq.py --mode all --size 64
 """
 
 import argparse
+import json
 import math
+import random
+import time
+from pathlib import Path
+from typing import Optional, Tuple, Dict, List
+
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import numpy as np
+try:
+    import imageio
+except ImportError:
+    imageio = None
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from typing import Optional, Tuple, Dict, List
-import time
-import json
-from pathlib import Path
 
 # ================== Ground Truth Simulators ==================
 
@@ -60,14 +61,6 @@ def heat_step_variable(u: torch.Tensor, alpha_map: torch.Tensor) -> torch.Tensor
     return u + alpha_map.unsqueeze(0) * lap
 
 
-def heat_step_source(u: torch.Tensor, alpha: float, source: torch.Tensor) -> torch.Tensor:
-    """Heat step with source term."""
-    u_pad = F.pad(u, (1, 1, 1, 1), mode="replicate")
-    lap = (
-        u_pad[:, 1:-1, 2:] + u_pad[:, 1:-1, :-2] + 
-        u_pad[:, 2:, 1:-1] + u_pad[:, :-2, 1:-1] - 4 * u
-    )
-    return u + alpha * lap + 0.01 * source.unsqueeze(0)
 
 
 def generate_sequence(B: int, H: int, W: int, T: int, alpha: float, device) -> torch.Tensor:
@@ -104,21 +97,6 @@ def generate_variable_sequence(B: int, H: int, W: int, T: int, device) -> Tuple[
     return torch.stack(seq, 1), alpha_map
 
 
-def generate_source_sequence(B: int, H: int, W: int, T: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate sequence with heat source."""
-    # Create a gaussian source in center
-    x = torch.linspace(-1, 1, W, device=device)
-    y = torch.linspace(-1, 1, H, device=device)
-    xx, yy = torch.meshgrid(x, y, indexing='xy')
-    source = torch.exp(-2 * (xx**2 + yy**2))
-    
-    u0 = torch.zeros(B, H, W, device=device)
-    seq = [u0]
-    u = u0
-    for _ in range(T - 1):
-        u = heat_step_source(u, 0.1, source)
-        seq.append(u)
-    return torch.stack(seq, 1), source
 
 
 # ================== Utilities ==================
@@ -263,32 +241,28 @@ class NFTMHeatFixed(NFTMHeatBase):
         return delta, dbg
 
 class NFTMHeatLearnable(NFTMHeatBase):
-    """NFTM with learnable global alpha via heteroscedastic-style loss."""
+    """NFTM with learnable global alpha"""
+
 
     def __init__(self, H: int, W: int, alpha_range: Tuple[float, float] = (0.05, 0.20), physical_lap: bool = False, **kwargs):
-        # Swallow 'physical_lap' so it doesn't leak to the base class
         kwargs.pop("physical_lap", None)
-        # Extract base-class kwargs safely
         pe_freqs = kwargs.pop("pe_freqs", 8)
         hidden_dim = kwargs.pop("hidden_dim", 128)
         super().__init__(H, W, pe_freqs=pe_freqs, hidden_dim=hidden_dim)
 
         self.alpha_min, self.alpha_max = alpha_range
-        self.physical_lap = physical_lap  # if True, scale Laplacian by 4 to match 5-point operator
-
-        # Whether to learn a spatially-varying alpha map (used in variable mode)
+        self.physical_lap = physical_lap
         self.learn_spatial_alpha: bool = kwargs.pop("learn_spatial_alpha", False)
 
         # Learn log(alpha) with wide feasible range; we'll clamp later
-        init_alpha = float(np.sqrt(alpha_range[0] * alpha_range[1]))
+        init_alpha = 0.01
         self.log_alpha = nn.Parameter(torch.log(torch.tensor(init_alpha)))
 
-        # Separate noise scale for decoupled Gaussian NLL
-        self.log_sigma = nn.Parameter(torch.tensor(-2.0))  # σ ≈ 0.135
-
-        # If learning spatial alpha, define a small CNN head to predict alpha_map in [alpha_min, alpha_max]
         if self.learn_spatial_alpha:
-            # Alpha head takes field plus 2D positional channels (x,y)
+            yy = torch.linspace(-1.0, 1.0, self.H).view(1, 1, self.H, 1)
+            xx = torch.linspace(-1.0, 1.0, self.W).view(1, 1, 1, self.W)
+            pos = torch.cat([xx.expand(1, 1, self.H, self.W), yy.expand(1, 1, self.H, self.W)], dim=1)
+            self.register_buffer('pos_channels', pos)
             self.alpha_net = nn.Sequential(
                 nn.Conv2d(3, 16, 3, padding=1),
                 nn.ReLU(),
@@ -296,53 +270,10 @@ class NFTMHeatLearnable(NFTMHeatBase):
                 nn.ReLU(),
                 nn.Conv2d(16, 1, 3, padding=1)
             )
-            # Precompute normalized coordinate channels in [-1, 1]
-            yy = torch.linspace(-1.0, 1.0, self.H).view(1, 1, self.H, 1)
-            xx = torch.linspace(-1.0, 1.0, self.W).view(1, 1, 1, self.W)
-            pos = torch.cat([xx.expand(1, 1, self.H, self.W), yy.expand(1, 1, self.H, self.W)], dim=1)
-            self.register_buffer('pos_channels', pos)
 
-        # Running stats kept for monitoring (not used in loss)
         self.register_buffer('running_lap_scale', torch.tensor(1.0))
         self.register_buffer('running_delta_scale', torch.tensor(1.0))
         self.momentum = 0.95
-
-    def compute_heteroscedastic_loss(self, delta_pred, gt_delta, laplacian, beta=1.0,
-                                     use_lap_weighting: bool = False, weight_gamma: float = 1.0,
-                                     alpha_override: Optional[torch.Tensor] = None):
-        """
-        Decoupled Gaussian NLL:
-            μ = α * L_phys
-            σ is learned separately (global), independent of α
-        """
-        if alpha_override is not None:
-            alpha = alpha_override  # allow per-head alpha (B×M)
-        else:
-            alpha = torch.exp(self.log_alpha)
-            alpha = torch.clamp(alpha, 1e-3, 1.0)
-        sigma2 = torch.exp(2.0 * self.log_sigma)
-
-        # Use provided laplacian (should be physical if flag is on)
-        mu = alpha * laplacian.detach()
-        err = gt_delta - mu
-
-        # Penalize log term with beta to discourage sigma inflation (beta >= 1 tightens)
-        nll = 0.5 * (err * err) / (sigma2 + 1e-8) + 0.5 * beta * torch.log(sigma2 + 1e-8)
-
-        # Optional information weighting by |L| to emphasize informative pixels
-        if use_lap_weighting:
-            with torch.no_grad():
-                w = torch.abs(laplacian)
-                w = w / (w.mean() + 1e-8)
-                if weight_gamma != 1.0:
-                    w = torch.pow(w, weight_gamma)
-            nll = nll * w
-
-        # Tiny priors to keep parameters in reasonable ranges (reduced weights and shifted center)
-        # Set weights to 0.0 to remove bias entirely if desired.
-        prior = 1e-6 * (self.log_alpha - math.log(0.12))**2 + 1e-6 * (self.log_sigma + 2.0)**2
-
-        return (nll.mean() + prior)
 
     def predict_next_at_heads(self, field: torch.Tensor, heads: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
         center, avg4 = self.read_5tap(field, heads)
@@ -486,10 +417,9 @@ def train_phase_a(model, opt, mse, args, device, alpha_gt=None):
         # Generate data with appropriate alpha
         if alpha_gt is not None:
             gt = generate_sequence(args.batch_size, args.size, args.size, args.timesteps, alpha_gt, device)
-        elif args.mode == 'variable':
+        elif args.mode in ('variable', 'baseline'):
             gt, alpha_map = generate_variable_sequence(args.batch_size, args.size, args.size, args.timesteps, device)
-        elif args.mode == 'source':
-            gt, source = generate_source_sequence(args.batch_size, args.size, args.size, args.timesteps, device)
+        
         else:
             # Random alpha for learnable mode
             alpha = 0.1 if args.mode == 'learnable_alpha' else 0.1
@@ -514,37 +444,8 @@ def train_phase_a(model, opt, mse, args, device, alpha_gt=None):
                                         align_corners=True, padding_mode='border').squeeze(1).squeeze(-1)
             gt_delta_vals = gt_next_vals - gt_curr_vals
             
-            # If variable mode with spatial alpha, use heteroscedastic loss so alpha_map learns
-            if args.mode == 'variable' and getattr(model, 'learn_spatial_alpha', False):
-                L = dbg["laplacian"]
-                alpha_used = dbg.get("alpha_tensor", None)
-                step_loss = model.compute_heteroscedastic_loss(
-                    delta_pred, gt_delta_vals, L,
-                    beta=getattr(args, 'beta', 1.0),
-                    use_lap_weighting=getattr(args, 'use_lap_weighting', False),
-                    weight_gamma=getattr(args, 'weight_gamma', 1.0),
-                    alpha_override=alpha_used
-                )
-                loss = loss + step_loss
-            # Optional: learnable_alpha mode can also use heteroscedastic loss via CLI switch
-            elif args.mode == 'learnable_alpha' and getattr(args, 'learnable_alpha_loss', 'mse') == 'hetero':
-                # Robustly get Laplacian
-                if "laplacian" in dbg and dbg["laplacian"] is not None:
-                    L = dbg["laplacian"]
-                else:
-                    c_tmp, a_tmp = model.read_5tap(field_t, heads)
-                    L = a_tmp - c_tmp
-                    if getattr(model, 'physical_lap', False):
-                        L = 4.0 * L
-                step_loss = model.compute_heteroscedastic_loss(
-                    delta_pred, gt_delta_vals, L,
-                    beta=getattr(args, 'beta', 1.0),
-                    use_lap_weighting=getattr(args, 'use_lap_weighting', False),
-                    weight_gamma=getattr(args, 'weight_gamma', 1.0)
-                )
-                loss = loss + step_loss
-            else:
-                loss = loss + mse(delta_pred, gt_delta_vals)
+            # Always use MSE loss
+            loss = loss + mse(delta_pred, gt_delta_vals)
             
             # Robust effective alpha logging: median ± IQR over active pixels
             if "laplacian" in dbg and dbg["laplacian"] is not None:
@@ -600,10 +501,9 @@ def train_phase_b(model, opt, mse, args, device, alpha_gt=None):
         # Generate data
         if alpha_gt is not None:
             gt = generate_sequence(args.batch_size, args.size, args.size, args.timesteps, alpha_gt, device)
-        elif args.mode == 'variable':
+        elif args.mode in ('variable', 'baseline'):
             gt, alpha_map = generate_variable_sequence(args.batch_size, args.size, args.size, args.timesteps, device)
-        elif args.mode == 'source':
-            gt, source = generate_source_sequence(args.batch_size, args.size, args.size, args.timesteps, device)
+        
         else:
             alpha = 0.1 if args.mode == 'learnable_alpha' else 0.1
             gt = generate_sequence(args.batch_size, args.size, args.size, args.timesteps, alpha, device)
@@ -646,13 +546,45 @@ def train_phase_b(model, opt, mse, args, device, alpha_gt=None):
     return losses, psnrs
 
 
+def evaluate_variable_model(model, args, device, batches: int = 4) -> Tuple[float, float]:
+    """Evaluate variable-α model on synthetic sequences."""
+    model_was_training = model.training
+    model.eval()
+    mse = nn.MSELoss()
+    losses: List[float] = []
+    psnrs: List[float] = []
+
+    with torch.no_grad():
+        for _ in range(batches):
+            gt, _ = generate_variable_sequence(args.batch_size, args.size, args.size, args.timesteps, device)
+            f0 = gt[:, 0].unsqueeze(1)
+            heads_seq = [make_exact_grid_heads(args.batch_size, args.size, args.size, device)
+                         for _ in range(args.timesteps - 1)]
+            fields = model(f0, heads_seq)
+            pred = torch.stack(fields, 1).squeeze(2)
+
+            loss = mse(pred, gt)
+            losses.append(loss.item())
+
+            psnr = -10.0 * torch.log10(((pred - gt) ** 2).mean()).item()
+            psnrs.append(psnr)
+
+    if model_was_training:
+        model.train()
+
+    return float(np.mean(losses)), float(np.mean(psnrs))
+
+
 def train_baseline(model, opt, mse, args, device):
     """Train baseline models."""
     losses = []
     
     for epoch in range(1, args.epochs_a + args.epochs_b + 1):
-        alpha = np.random.uniform(0.05, 0.20) if args.mode == 'baseline' else 0.1
-        gt = generate_sequence(args.batch_size, args.size, args.size, args.timesteps, alpha, device)
+        if args.mode == 'baseline':
+            gt, alpha_map = generate_variable_sequence(args.batch_size, args.size, args.size, args.timesteps, device)
+        else:
+            alpha = 0.1
+            gt = generate_sequence(args.batch_size, args.size, args.size, args.timesteps, alpha, device)
         
         u0 = gt[:, 0].unsqueeze(1)
         pred = model.rollout(u0, args.timesteps).squeeze(2)
@@ -677,8 +609,11 @@ def train_baseline_timeboxed(model, opt, mse, args, device, time_budget_s: float
     start = time.time()
     steps = 0
     while time.time() - start < time_budget_s:
-        alpha = np.random.uniform(0.05, 0.20) if args.mode == 'baseline' else 0.1
-        gt = generate_sequence(args.batch_size, args.size, args.size, args.timesteps, alpha, device)
+        if args.mode == 'baseline':
+            gt, alpha_map = generate_variable_sequence(args.batch_size, args.size, args.size, args.timesteps, device)
+        else:
+            alpha = 0.1
+            gt = generate_sequence(args.batch_size, args.size, args.size, args.timesteps, alpha, device)
         u0 = gt[:, 0].unsqueeze(1)
         pred = model.rollout(u0, args.timesteps).squeeze(2)
         loss = mse(pred, gt)
@@ -688,16 +623,26 @@ def train_baseline_timeboxed(model, opt, mse, args, device, time_budget_s: float
         steps += 1
     return steps
 
-def train_nftm_timeboxed(model, opt, mse, args, device, time_budget_s: float, alpha_gt: float = 0.1, split_a: float = 0.3):
+def train_nftm_timeboxed(model, opt, mse, args, device, time_budget_s: float, alpha_gt: Optional[float] = 0.1,
+                          split_a: float = 0.3):
     """Time-boxed NFTM training: spend split_a on Phase A, remainder on Phase B."""
     total_start = time.time()
     a_budget = max(0.0, min(1.0, split_a)) * time_budget_s
     b_budget = time_budget_s - a_budget
 
+    def sample_sequence():
+        if alpha_gt is not None:
+            return generate_sequence(args.batch_size, args.size, args.size, args.timesteps, alpha_gt, device)
+        if args.mode in ('variable', 'baseline'):
+            seq, _ = generate_variable_sequence(args.batch_size, args.size, args.size, args.timesteps, device)
+            return seq
+        
+        return generate_sequence(args.batch_size, args.size, args.size, args.timesteps, 0.1, device)
+
     # Phase A (teacher-forced)
     a_start = time.time()
-    while time.time() - a_start < a_budget:
-        gt = generate_sequence(args.batch_size, args.size, args.size, args.timesteps, alpha_gt, device)
+    while time.time() - a_start < a_budget and time.time() - total_start < time_budget_s:
+        gt = sample_sequence()
         heads_seq = [make_exact_grid_heads(args.batch_size, args.size, args.size, device) for _ in range(args.timesteps - 1)]
         loss = 0.0
         for t in range(args.timesteps - 1):
@@ -717,7 +662,7 @@ def train_nftm_timeboxed(model, opt, mse, args, device, time_budget_s: float, al
     # Phase B (rollout)
     b_start = time.time()
     while time.time() - b_start < b_budget and time.time() - total_start < time_budget_s:
-        gt = generate_sequence(args.batch_size, args.size, args.size, args.timesteps, alpha_gt, device)
+        gt = sample_sequence()
         f0 = gt[:, 0].unsqueeze(1)
         heads_seq = [make_exact_grid_heads(args.batch_size, args.size, args.size, device) for _ in range(args.timesteps - 1)]
         fields = model(f0, heads_seq)
@@ -737,116 +682,7 @@ def train_nftm_timeboxed(model, opt, mse, args, device, time_budget_s: float, al
         opt.step()
 
 
-# ================== Evaluation Functions ==================
-
-def evaluate_stability(model, args, device):
-    """Test long rollout stability."""
-    print("\n=== Stability Test ===")
-    
-    # Generate long sequence
-    gt = generate_sequence(1, args.size, args.size, args.rollout_steps, 0.1, device)
-    f0 = gt[:, 0].unsqueeze(1)
-    
-    # For NFTM models
-    if hasattr(model, 'predict_next_at_heads'):
-        heads_seq = [make_exact_grid_heads(1, args.size, args.size, device) 
-                    for _ in range(args.rollout_steps - 1)]
-        fields = model(f0, heads_seq)
-        pred = torch.stack(fields, 1).squeeze(2)
-    else:
-        # For baseline models
-        pred = model.rollout(f0, args.rollout_steps).squeeze(2)
-    
-    # Compute error over time
-    errors = []
-    psnrs = []
-    for t in range(args.rollout_steps):
-        mse_t = ((pred[:, t] - gt[:, t]) ** 2).mean().item()
-        psnr_t = -10.0 * math.log10(mse_t + 1e-10)
-        errors.append(mse_t)
-        psnrs.append(psnr_t)
-    
-    # Plot
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-
-    ax1.semilogy(range(len(errors)), errors, color='tab:blue', lw=2, label='MSE')
-    ax1.set_xlabel('Time step', fontsize=11)
-    ax1.set_ylabel('Mean Squared Error', fontsize=11)
-    ax1.set_title(f'Error Accumulation (H=W={args.size})', fontsize=12)
-    ax1.grid(True, alpha=0.3, which='both')
-    ax1.legend(loc='upper right', fontsize=10)
-
-    ax2.plot(range(len(psnrs)), psnrs, color='tab:green', lw=2, label='PSNR')
-    ax2.set_xlabel('Time step', fontsize=11)
-    ax2.set_ylabel('PSNR [dB]', fontsize=11)
-    ax2.set_title(f'PSNR over Time (steps={args.rollout_steps})', fontsize=12)
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc='lower right', fontsize=10)
-
-    fig.suptitle('Stability Test', fontsize=13)
-    plt.tight_layout()
-    plt.savefig(f'stability_{args.mode}_{args.size}.png', dpi=300, bbox_inches='tight')
-    plt.show()
-    
-    print(f"Final MSE at t={args.rollout_steps}: {errors[-1]:.6f}")
-    print(f"Final PSNR at t={args.rollout_steps}: {psnrs[-1]:.2f} dB")
-    
-    return errors, psnrs
-
-
-def evaluate_super_resolution(model, args, device):
-    """Test super-resolution capability."""
-    print("\n=== Super-Resolution Test ===")
-    
-    # Train on coarse, test on fine
-    train_size = args.train_size
-    test_size = args.test_size
-    
-    # Generate test data at high resolution
-    gt_fine = generate_sequence(1, test_size, test_size, 10, 0.1, device)
-    
-    # Downsample initial condition
-    f0_coarse = F.interpolate(gt_fine[:, 0].unsqueeze(1), size=(train_size, train_size), mode='bilinear')
-    f0_fine = F.interpolate(f0_coarse, size=(test_size, test_size), mode='bilinear')
-    
-    # Run model at fine resolution
-    heads_seq = [make_exact_grid_heads(1, test_size, test_size, device) for _ in range(9)]
-    
-    # Modify model to work at new resolution
-    old_H, old_W = model.H, model.W
-    model.H, model.W = test_size, test_size
-    
-    fields = model(f0_fine, heads_seq)
-    pred_fine = torch.stack(fields, 1).squeeze(2)
-    
-    # Restore original resolution
-    model.H, model.W = old_H, old_W
-    
-    # Compute metrics
-    mse = ((pred_fine - gt_fine[:, :10]) ** 2).mean().item()
-    psnr = -10.0 * math.log10(mse + 1e-10)
-    
-    # Visualize
-    fig, axes = plt.subplots(2, 5, figsize=(15, 6))
-    for t in range(5):
-        axes[0, t].imshow(gt_fine[0, t].detach().numpy(), cmap='hot', vmin=0, vmax=1)
-        axes[0, t].set_title(f't={t}')
-        axes[0, t].axis('off')
-        
-        axes[1, t].imshow(pred_fine[0, t].detach().numpy(), cmap='hot', vmin=0, vmax=1)
-        axes[1, t].axis('off')
-    
-    axes[0, 0].set_ylabel(f'GT ({test_size}x{test_size})')
-    axes[1, 0].set_ylabel(f'NFTM ({train_size}→{test_size})')
-    
-    plt.suptitle(f'Super-Resolution Test: PSNR = {psnr:.2f} dB')
-    plt.tight_layout()
-    plt.savefig(f'super_res_{train_size}_to_{test_size}.png')
-    plt.show()
-    
-    print(f"Super-resolution {train_size}→{test_size}: PSNR = {psnr:.2f} dB")
-    
-    return psnr
+# ================== Evaluation Functions =================
 
 
 def compare_baselines(args, device):
@@ -858,7 +694,7 @@ def compare_baselines(args, device):
     # Train and evaluate each model
     all_models = {
         'NFTM-Fixed': NFTMHeatFixed(args.size, args.size),
-        'NFTM-Learnable': NFTMHeatLearnable(args.size, args.size),
+        'NFTM-Learnable': NFTMHeatLearnable(args.size, args.size, learn_spatial_alpha=True),
         'ConvNet': ConvNetBaseline(),
         'UNet': UNetBaseline()  # always instantiate UNet
     }
@@ -868,45 +704,64 @@ def compare_baselines(args, device):
     
     for name, model in models.items():
         print(f"\nTraining {name}...")
+
+        # Reset RNGs so every baseline sees identical synthetic data
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        random.seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+
         model = model.to(device)
         opt = torch.optim.Adam(model.parameters(), lr=args.lr)
         mse = nn.MSELoss()
-        
+
         # Count parameters
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        
+
         # Train/evaluate
         start_time = time.time()
-        
+
+        eval_T = args.eval_timesteps or args.timesteps
+
         if name == 'NFTM-Fixed':
             # No training needed; evaluate the fixed-physics rollout directly
             with torch.no_grad():
-                gt = generate_sequence(1, args.size, args.size, args.timesteps, 0.1, device)
+                gt, _ = generate_variable_sequence(1, args.size, args.size, eval_T, device)
                 f0 = gt[:, 0].unsqueeze(1)
-                heads_seq = [make_exact_grid_heads(1, args.size, args.size, device) 
-                             for _ in range(args.timesteps - 1)]
+                heads_seq = [make_exact_grid_heads(1, args.size, args.size, device)
+                             for _ in range(eval_T - 1)]
                 fields = model(f0, heads_seq)
                 pred = torch.stack(fields, 1).squeeze(2)
                 final_psnr = -10.0 * torch.log10(((pred - gt) ** 2).mean()).item()
             train_time = time.time() - start_time
         elif 'NFTM' in name:
             if getattr(args, 'time_budget_s', 0.0) > 0.0:
-                train_nftm_timeboxed(model, opt, mse, args, device, args.time_budget_s, alpha_gt=0.1, split_a=args.time_split_a)
+                train_nftm_timeboxed(model, opt, mse, args, device, args.time_budget_s, alpha_gt=None, split_a=args.time_split_a)
                 train_time = time.time() - start_time
                 # Evaluate PSNR after time-boxed training
                 with torch.no_grad():
-                    gt = generate_sequence(1, args.size, args.size, args.timesteps, 0.1, device)
+                    gt, _ = generate_variable_sequence(1, args.size, args.size, eval_T, device)
                     f0 = gt[:, 0].unsqueeze(1)
-                    heads_seq = [make_exact_grid_heads(1, args.size, args.size, device) for _ in range(args.timesteps - 1)]
+                    heads_seq = [make_exact_grid_heads(1, args.size, args.size, device) for _ in range(eval_T - 1)]
                     fields = model(f0, heads_seq)
                     pred = torch.stack(fields, 1).squeeze(2)
                     final_psnr = -10.0 * torch.log10(((pred - gt) ** 2).mean()).item()
             else:
                 # Two-phase training for NFTM (epoch-based)
-                train_phase_a(model, opt, mse, args, device, alpha_gt=0.1)
-                _, psnrs = train_phase_b(model, opt, mse, args, device, alpha_gt=0.1)
+                train_phase_a(model, opt, mse, args, device, alpha_gt=None)
+                _, psnrs = train_phase_b(model, opt, mse, args, device, alpha_gt=None)
                 final_psnr = psnrs[-1] if psnrs else 0
                 train_time = time.time() - start_time
+                # Optional evaluation on extended horizon
+                if args.eval_timesteps:
+                    with torch.no_grad():
+                        gt, _ = generate_variable_sequence(1, args.size, args.size, eval_T, device)
+                        f0 = gt[:, 0].unsqueeze(1)
+                        heads_seq = [make_exact_grid_heads(1, args.size, args.size, device) for _ in range(eval_T - 1)]
+                        fields = model(f0, heads_seq)
+                        pred = torch.stack(fields, 1).squeeze(2)
+                        final_psnr = -10.0 * torch.log10(((pred - gt) ** 2).mean()).item()
         else:
             if getattr(args, 'time_budget_s', 0.0) > 0.0:
                 train_baseline_timeboxed(model, opt, mse, args, device, args.time_budget_s)
@@ -917,8 +772,8 @@ def compare_baselines(args, device):
                 train_time = time.time() - start_time
             # Evaluate final PSNR
             with torch.no_grad():
-                gt = generate_sequence(1, args.size, args.size, args.timesteps, 0.1, device)
-                pred = model.rollout(gt[:, 0].unsqueeze(1), args.timesteps).squeeze(2)
+                gt, _ = generate_variable_sequence(1, args.size, args.size, eval_T, device)
+                pred = model.rollout(gt[:, 0].unsqueeze(1), eval_T).squeeze(2)
                 final_psnr = -10.0 * torch.log10(((pred - gt) ** 2).mean()).item()
         
         # Test inference speed
@@ -960,191 +815,118 @@ def compare_baselines(args, device):
 
 
 def test_learnable_alpha(args, device):
-    """Test if model learns correct alpha values using heteroscedastic loss with hyperparameter search."""
-    print("\n=== Learnable Alpha Test (Heteroscedastic with Tuning) ===")
+    """Test if model learns correct alpha values using simple MSE supervision over deltas."""
+    print("\n=== Learnable Alpha Test (MSE) ===")
     
     # Test different alpha values
     test_alphas = [0.05, 0.10, 0.15, 0.20]
     learned_alphas = {}
     
-    # Hyperparameter search for beta (weight of log term)
-    beta_values = [0.1, 0.5, 1.0, 2.0]
-    
+    # Simple per-alpha training (beta & sigma removed)
     for alpha_true in test_alphas:
         print(f"\nTraining with alpha = {alpha_true}")
-        
-        best_alpha = None
-        best_error = float('inf')
-        best_beta = None
-        
-        # Try different beta values
-        for beta in beta_values:
-            # Create fresh model for each attempt
-            model = NFTMHeatLearnable(args.size, args.size).to(device)
-            model.physical_lap = True
 
-            # Keep default initialization from model constructor (no closed-form alpha init)
-            
-            # Adaptive learning rate based on alpha magnitude
-            base_lr = 0.001 if alpha_true < 0.1 else 0.002
-            # Per-parameter LR: optionally scale log_alpha and log_sigma
-            param_groups = [
-                {"params": [p for n, p in model.named_parameters() if n not in ["log_alpha", "log_sigma"]], "lr": base_lr},
-                {"params": [model.log_alpha], "lr": base_lr * getattr(args, 'alpha_lr_mult', 1.0)},
-                {"params": [model.log_sigma], "lr": base_lr * getattr(args, 'sigma_lr_mult', 1.0)},
-            ]
-            opt = torch.optim.Adam(param_groups)
-            
-            # Train with heteroscedastic loss
-            alpha_history = []
-            
-            for epoch in range(args.test_alpha_epochs):
-                epoch_loss = 0.0
-                alpha_preds = []
-                for _ in range(args.test_alpha_batches_per_epoch):
-                    gt = generate_sequence(args.batch_size, args.size, args.size, args.timesteps, alpha_true, device)
-                    heads_seq = [make_exact_grid_heads(args.batch_size, args.size, args.size, device) 
-                                for _ in range(args.timesteps - 1)]
-
-                    batch_loss = 0.0
-                    for t in range(args.timesteps - 1):
-                        field_t = gt[:, t].unsqueeze(1)
-                        heads = heads_seq[t]
-
-                        # Get prediction
-                        delta_pred, dbg = model.predict_next_at_heads(field_t, heads)
-
-                        # Compute ground truth delta
-                        grid = heads.view(args.batch_size, -1, 1, 2)
-                        gt_next_vals = F.grid_sample(gt[:, t+1].unsqueeze(1), grid,
-                                                    align_corners=True, padding_mode='border').squeeze(1).squeeze(-1)
-                        gt_curr_vals = F.grid_sample(gt[:, t].unsqueeze(1), grid,
-                                                    align_corners=True, padding_mode='border').squeeze(1).squeeze(-1)
-                        gt_delta = gt_next_vals - gt_curr_vals
-
-                        # Heteroscedastic loss
-                        # Robust: compute Laplacian locally if dbg lacks it
-                        if "laplacian" in dbg:
-                            L = dbg["laplacian"]
-                        else:
-                            c_tmp, a_tmp = model.read_5tap(field_t, heads)
-                            L = a_tmp - c_tmp
-                            if getattr(model, 'physical_lap', False):
-                                L = 4.0 * L
-
-                        step_loss = model.compute_heteroscedastic_loss(
-                            delta_pred, gt_delta, L, beta=beta,
-                            use_lap_weighting=getattr(args, 'use_lap_weighting', False),
-                            weight_gamma=getattr(args, 'weight_gamma', 1.0)
-                        )
-                        batch_loss = batch_loss + step_loss
-
-                        alpha_preds.append(dbg["alpha"].mean().item())
-
-                    # Average over time steps
-                    batch_loss = batch_loss / (args.timesteps - 1)
-                    epoch_loss = epoch_loss + batch_loss
-
-                # Average over batches this epoch
-                loss = epoch_loss / max(1, args.test_alpha_batches_per_epoch)
-
-                opt.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-
-                current_alpha = np.mean(alpha_preds) if alpha_preds else float('nan')
-                alpha_history.append(current_alpha)
-                
-                # Learning rate decay
-                if epoch > 100 and epoch % 50 == 0:
-                    for param_group in opt.param_groups:
-                        param_group['lr'] *= 0.7
-            
-            # Check if this beta gives better results
-            final_alpha = np.median(alpha_history[-20:])
-            error = abs(final_alpha - alpha_true)
-            
-            if error < best_error:
-                best_error = error
-                best_alpha = final_alpha
-                best_beta = beta
-        
-        learned_alphas[alpha_true] = best_alpha
-        print(f"True α = {alpha_true:.3f}, Learned α = {best_alpha:.3f}, Error = {best_error:.4f}, Best β = {best_beta}")
-    
-    # Alternative: Train with curriculum learning
-    print("\n--- Trying Curriculum Learning ---")
-    curriculum_alphas = {}
-    
-    for alpha_true in test_alphas:
-        print(f"\nCurriculum training with alpha = {alpha_true}")
-        
         model = NFTMHeatLearnable(args.size, args.size).to(device)
         model.physical_lap = True
-    # Keep default initialization from model constructor (no closed-form alpha init)
-        base_lr = 0.002
+
+        # Adaptive learning rate based on alpha magnitude
+        base_lr = 0.001 if alpha_true < 0.1 else 0.002
         param_groups = [
-            {"params": [p for n, p in model.named_parameters() if n not in ["log_alpha", "log_sigma"]], "lr": base_lr},
+            {"params": [p for n, p in model.named_parameters() if n != "log_alpha"], "lr": base_lr},
             {"params": [model.log_alpha], "lr": base_lr * getattr(args, 'alpha_lr_mult', 1.0)},
-            {"params": [model.log_sigma], "lr": base_lr * getattr(args, 'sigma_lr_mult', 1.0)},
         ]
         opt = torch.optim.Adam(param_groups)
-        
-        # Start with shorter sequences and gradually increase
-        for curriculum_stage, T_curr in enumerate([3, 5, 7, 10]):
-            alpha_history = []
-            
-            for epoch in range(args.test_alpha_curriculum_epochs):
-                gt = generate_sequence(args.batch_size, args.size, args.size, T_curr, alpha_true, device)
-                heads_seq = [make_exact_grid_heads(args.batch_size, args.size, args.size, device) 
-                            for _ in range(T_curr - 1)]
-                
-                loss = 0.0
-                alpha_preds = []
-                
-                for t in range(T_curr - 1):
+
+        alpha_history = []
+
+        for epoch in range(args.test_alpha_epochs):
+            epoch_loss = 0.0
+            alpha_preds = []
+            for _ in range(args.test_alpha_batches_per_epoch):
+                gt = generate_sequence(args.batch_size, args.size, args.size, args.timesteps, alpha_true, device)
+                heads_seq = [make_exact_grid_heads(args.batch_size, args.size, args.size, device)
+                             for _ in range(args.timesteps - 1)]
+
+                batch_loss = 0.0
+                for t in range(args.timesteps - 1):
                     field_t = gt[:, t].unsqueeze(1)
                     heads = heads_seq[t]
-                    
                     delta_pred, dbg = model.predict_next_at_heads(field_t, heads)
-                    
                     grid = heads.view(args.batch_size, -1, 1, 2)
-                    gt_next_vals = F.grid_sample(gt[:, t+1].unsqueeze(1), grid,
-                                                align_corners=True, padding_mode='border').squeeze(1).squeeze(-1)
+                    gt_next_vals = F.grid_sample(gt[:, t + 1].unsqueeze(1), grid,
+                                                 align_corners=True, padding_mode='border').squeeze(1).squeeze(-1)
                     gt_curr_vals = F.grid_sample(gt[:, t].unsqueeze(1), grid,
-                                                align_corners=True, padding_mode='border').squeeze(1).squeeze(-1)
+                                                 align_corners=True, padding_mode='border').squeeze(1).squeeze(-1)
                     gt_delta = gt_next_vals - gt_curr_vals
-                    
-                    # Use best beta from hyperparameter search
-                    step_loss = model.compute_heteroscedastic_loss(
-                        delta_pred, gt_delta, dbg["laplacian"], beta=1.0,
-                        use_lap_weighting=getattr(args, 'use_lap_weighting', False),
-                        weight_gamma=getattr(args, 'weight_gamma', 1.0)
-                    )
-                    loss = loss + step_loss
-                    
+                    step_loss = F.mse_loss(delta_pred, gt_delta)
+                    batch_loss = batch_loss + step_loss
                     alpha_preds.append(dbg["alpha"].mean().item())
-                
-                loss = loss / (T_curr - 1)
-                
-                opt.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-                
-                alpha_history.append(np.mean(alpha_preds))
-            
-            print(f"  Stage {curriculum_stage+1} (T={T_curr}): α = {alpha_history[-1]:.4f}")
-        
-        curriculum_alphas[alpha_true] = np.median(alpha_history[-10:])
+                batch_loss = batch_loss / (args.timesteps - 1)
+                epoch_loss = epoch_loss + batch_loss
+
+            loss = epoch_loss / max(1, args.test_alpha_batches_per_epoch)
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+            current_alpha = np.mean(alpha_preds) if alpha_preds else float('nan')
+            alpha_history.append(current_alpha)
+
+            if epoch > 100 and epoch % 50 == 0:
+                for param_group in opt.param_groups:
+                    param_group['lr'] *= 0.7
+
+        final_alpha = np.median(alpha_history[-20:])
+        error = abs(final_alpha - alpha_true)
+        learned_alphas[alpha_true] = final_alpha
+        print(f"True α = {alpha_true:.3f}, Learned α = {final_alpha:.3f}, Error = {error:.4f}")
     
-    # Use best results
-    if np.mean([abs(curriculum_alphas[k] - k) for k in test_alphas]) < np.mean([abs(learned_alphas[k] - k) for k in test_alphas]):
-        print("\nUsing curriculum learning results (better)")
-        learned_alphas = curriculum_alphas
-    else:
-        print("\nUsing hyperparameter search results (better)")
+    # ------------------------------------------------------------------
+    # Optional Curriculum Learning Template (commented out)
+    # ------------------------------------------------------------------
+    # The idea: start training on shorter temporal horizons (small T) so
+    # alpha can be estimated from very local temporal derivatives, then
+    # gradually increase sequence length to improve stability over longer
+    # rollouts. This was removed from the active path for simplicity, but
+    # you can re-enable it by uncommenting and adapting as needed.
+    #
+    # Example usage plan:
+    #   for alpha_true in test_alphas:
+    #       model = NFTMHeatLearnable(args.size, args.size).to(device)
+    #       model.physical_lap = True
+    #       opt = torch.optim.Adam([
+    #           {"params": [p for n,p in model.named_parameters() if n != 'log_alpha'], "lr": 0.002},
+    #           {"params": [model.log_alpha], "lr": 0.002 * getattr(args,'alpha_lr_mult',1.0)}
+    #       ])
+    #       time_scales = [3, 5, 7, args.timesteps]
+    #       for stage_T in time_scales:
+    #           for epoch in range(args.test_alpha_curriculum_epochs):
+    #               gt = generate_sequence(args.batch_size, args.size, args.size, stage_T, alpha_true, device)
+    #               heads_seq = [make_exact_grid_heads(args.batch_size, args.size, args.size, device)
+    #                            for _ in range(stage_T - 1)]
+    #               loss = 0.0
+    #               for t in range(stage_T - 1):
+    #                   field_t = gt[:, t].unsqueeze(1)
+    #                   heads = heads_seq[t]
+    #                   delta_pred, dbg = model.predict_next_at_heads(field_t, heads)
+    #                   grid = heads.view(args.batch_size, -1, 1, 2)
+    #                   gt_next_vals = F.grid_sample(gt[:, t+1].unsqueeze(1), grid, align_corners=True, padding_mode='border').squeeze(1).squeeze(-1)
+    #                   gt_curr_vals = F.grid_sample(gt[:, t].unsqueeze(1), grid, align_corners=True, padding_mode='border').squeeze(1).squeeze(-1)
+    #                   gt_delta = gt_next_vals - gt_curr_vals
+    #                   loss = loss + F.mse_loss(delta_pred, gt_delta)
+    #               loss = loss / (stage_T - 1)
+    #               opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step()
+    #           # (Optional) inspect alpha after each stage:
+    #           # est_alpha = torch.exp(model.log_alpha).item(); print(f"Stage T={stage_T}: alpha≈{est_alpha:.4f}")
+    #       # After curriculum, evaluate final alpha similarly to main path.
+    #
+    # Notes / future extensions:
+    #   * Could anneal learning rate per stage.
+    #   * Could add light L2 prior pushing alpha into [alpha_min, alpha_max].
+    #   * For spatial alpha (learn_spatial_alpha=True) replace log_alpha branch
+    #     with sampling predicted alpha map at heads and perhaps add TV regularizer.
+    # ------------------------------------------------------------------
     
     # Plot results
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
@@ -1180,7 +962,7 @@ def test_learnable_alpha(args, device):
     ax2.legend(fontsize=9)
     ax2.grid(True, alpha=0.3, axis='y')
     
-    fig.suptitle(f'Heteroscedastic loss, MAE={np.mean(errors):.4f}', fontsize=12, y=0.98)
+    fig.suptitle(f'Alpha learning (MSE), MAE={np.mean(errors):.4f}', fontsize=12, y=0.98)
     plt.tight_layout()
     plt.savefig('alpha_learning_test.png', dpi=300, bbox_inches='tight')
     plt.show()
@@ -1191,19 +973,68 @@ def test_learnable_alpha(args, device):
     print(f"Mean absolute error: {mean_error:.4f}")
     
     if mean_error < 0.02:
-        print("✓ Success! Heteroscedastic loss learns alpha accurately.")
+        print("✓ Success! Model learns alpha accurately with plain MSE.")
         print("\nKey insights:")
-        print("• Treating alpha as aleatoric uncertainty enables joint learning")
-        print("• Adaptive scaling and proper initialization are crucial")
-        print("• This connects PDE learning to uncertainty quantification")
+        print("• Simple MSE on deltas is sufficient here")
+        print("• Accurate Laplacian-based target deltas drive parameter recovery")
+        print("• Embedding PDE structure reduces need for uncertainty modeling")
     elif mean_error < 0.05:
-        print("○ Good results with heteroscedastic loss.")
+        print("○ Good results with MSE supervision.")
         print("• Model learns approximate physical parameters")
         print("• Further tuning could improve accuracy")
     else:
-        print("△ Learning remains challenging but approach is principled.")
+        print("△ Learning remains challenging; consider longer Phase A or lr schedule tweaks.")
     
     return learned_alphas
+
+
+def save_heat_animation(gt_tensor: torch.Tensor, pred_tensor: torch.Tensor, args, output_dir: Path, fps: int = 4) -> None:
+    """Save a short GIF comparing ground-truth and predicted heat fields over time."""
+    if imageio is None:
+        print("Warning: imageio not available; skipping GIF generation.")
+        return
+
+    try:
+        gif_path = output_dir / f'heat_evolution_{args.size}.gif'
+        gt_np = gt_tensor.detach().cpu().numpy()
+        pred_np = pred_tensor.detach().cpu().numpy()
+
+        if gt_np.shape[0] == 0 or pred_np.shape[0] == 0:
+            print("Warning: No frames available for animation; skipping GIF generation.")
+            return
+
+        frames: List[np.ndarray] = []
+        vmin, vmax = 0.0, 1.0
+
+        for t in range(gt_np.shape[1]):
+            fig, axes = plt.subplots(1, 2, figsize=(6, 3), dpi=120)
+            fig.suptitle(f'Timestep {t}', fontsize=10)
+            canvas = FigureCanvas(fig)
+
+            axes[0].imshow(gt_np[0, t], cmap='hot', vmin=vmin, vmax=vmax)
+            axes[0].set_title('Ground Truth')
+            axes[0].axis('off')
+
+            axes[1].imshow(pred_np[0, t], cmap='hot', vmin=vmin, vmax=vmax)
+            axes[1].set_title('Prediction')
+            axes[1].axis('off')
+
+            fig.tight_layout()
+            canvas.draw()
+            width, height = canvas.get_width_height()
+            frame = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
+            frame = frame.reshape((height, width, 4))[..., :3]
+            frames.append(frame)
+            plt.close(fig)
+
+        if frames:
+            imageio.mimsave(gif_path, frames, fps=fps)
+            print(f"Saved heat evolution animation to {gif_path}")
+        else:
+            print("Warning: No frames rendered; skipping GIF generation.")
+
+    except Exception as exc:
+        print(f"Warning: failed to save heat animation: {exc}")
 
 
 def visualize_results(model, args, device, mode_name=''):
@@ -1213,8 +1044,6 @@ def visualize_results(model, args, device, mode_name=''):
     # Generate test data
     if args.mode == 'variable':
         gt, alpha_map = generate_variable_sequence(1, args.size, args.size, args.timesteps, device)
-    elif args.mode == 'source':
-        gt, source = generate_source_sequence(1, args.size, args.size, args.timesteps, device)
     else:
         gt = generate_sequence(1, args.size, args.size, args.timesteps, 0.1, device)
     
@@ -1313,6 +1142,11 @@ def visualize_results(model, args, device, mode_name=''):
     
     print(f"PSNR per timestep: {' '.join([f'{p:.1f}' for p in psnr_per_t])}")
     
+    if args.mode == 'variable':
+        output_dir = Path(f'results_{args.mode}_{args.size}')
+        output_dir.mkdir(exist_ok=True)
+        save_heat_animation(gt, pred, args, output_dir)
+
     return psnr_per_t
 
 
@@ -1323,9 +1157,8 @@ def main():
     
     # Mode selection
     parser.add_argument('--mode', type=str, default='learnable_alpha',
-                       choices=['fixed', 'learnable_alpha', 'variable', 'source', 
-                               'baseline', 'stability', 'super_res', 'test_alpha', 'all'],
-                       help='Experiment mode')
+               choices=['fixed', 'learnable_alpha', 'variable', 'baseline', 'test_alpha', 'all'],
+               help='Experiment mode')
     
     # Model parameters
     parser.add_argument('--size', type=int, default=32, help='Grid size (H=W)')
@@ -1341,22 +1174,13 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     
     # Evaluation parameters
-    parser.add_argument('--rollout_steps', type=int, default=50, help='Steps for stability test')
-    parser.add_argument('--train_size', type=int, default=32, help='Training size for super-res')
-    parser.add_argument('--test_size', type=int, default=128, help='Test size for super-res')
+    # Removed: rollout_steps, train_size, test_size (legacy for deleted modes)
     # Test-alpha tuning knobs
     parser.add_argument('--test_alpha_epochs', type=int, default=400, help='Epochs per beta attempt in test_alpha')
     parser.add_argument('--test_alpha_batches_per_epoch', type=int, default=4, help='Synthetic batches per epoch in test_alpha')
     parser.add_argument('--test_alpha_curriculum_epochs', type=int, default=50, help='Epochs per curriculum stage in test_alpha')
     # Advanced knobs (safe defaults)
-    parser.add_argument('--use_lap_weighting', action='store_true', help='Weight loss by |L| to emphasize informative pixels')
-    parser.set_defaults(use_lap_weighting=True)
-    parser.add_argument('--weight_gamma', type=float, default=1.0, help='Exponent for Laplacian weighting')
-    parser.add_argument('--alpha_lr_mult', type=float, default=2.0, help='LR multiplier for log_alpha')
-    parser.add_argument('--sigma_lr_mult', type=float, default=0.5, help='LR multiplier for log_sigma')
-    parser.add_argument('--learnable_alpha_loss', type=str, choices=['mse', 'hetero'], default='mse',
-                        help='Loss used in learnable_alpha Phase A (default mse). Set to hetero to use heteroscedastic NLL.')
-    parser.add_argument('--beta', type=float, default=1.0, help='Beta coefficient for heteroscedastic log-term')
+    # MSE is the only loss used
     
     # Baseline selection
     parser.add_argument('--baseline_models', type=str, default='NFTM-Fixed,NFTM-Learnable,ConvNet,UNet',
@@ -1401,40 +1225,13 @@ def main():
         args_copy.mode = 'baseline'
         compare_baselines(args_copy, device)
         
-        # Stability test
-        model = NFTMHeatLearnable(args.size, args.size).to(device)
-        model.physical_lap = True
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-        mse = nn.MSELoss()
-        train_phase_a(model, opt, mse, args, device)
-        train_phase_b(model, opt, mse, args, device)
-        evaluate_stability(model, args, device)
+    # (Stability, super-res, source modes removed.)
         
     elif args.mode == 'test_alpha':
         test_learnable_alpha(args, device)
         
     elif args.mode == 'baseline':
         compare_baselines(args, device)
-        
-    elif args.mode == 'stability':
-        model = NFTMHeatLearnable(args.size, args.size).to(device)
-        model.physical_lap = True
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-        mse = nn.MSELoss()
-        print("Training model for stability test...")
-        train_phase_a(model, opt, mse, args, device)
-        train_phase_b(model, opt, mse, args, device)
-        evaluate_stability(model, args, device)
-        
-    elif args.mode == 'super_res':
-        model = NFTMHeatLearnable(args.train_size, args.train_size).to(device)
-        model.physical_lap = True
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-        mse = nn.MSELoss()
-        print(f"Training at {args.train_size}×{args.train_size}...")
-        train_phase_a(model, opt, mse, args, device)
-        train_phase_b(model, opt, mse, args, device)
-        evaluate_super_resolution(model, args, device)
         
     else:
         # Standard training modes
@@ -1447,9 +1244,6 @@ def main():
         elif args.mode == 'variable':
             model = NFTMHeatLearnable(args.size, args.size, learn_spatial_alpha=True).to(device)
             mode_name = "Variable α(x,y)"
-        elif args.mode == 'source':
-            model = NFTMHeatLearnable(args.size, args.size).to(device)
-            mode_name = "With Source Term"
         else:
             raise ValueError(f"Unsupported mode: {args.mode}")
 
@@ -1465,17 +1259,23 @@ def main():
         print("\nPhase A: Teacher-forced training")
         losses_a = train_phase_a(model, opt, mse, args, device)
 
-        # Phase B and visualization: use eval_timesteps if set and mode==variable
-        if args.mode == 'variable' and args.eval_timesteps is not None:
+        # Phase B (train on requested training horizon)
+        print("\nPhase B: Rollout training")
+        losses_b, psnrs = train_phase_b(model, opt, mse, args, device)
+
+        # Prepare evaluation args (optionally longer horizon)
+        if args.eval_timesteps is not None and args.eval_timesteps > 0:
             eval_args = argparse.Namespace(**vars(args))
             eval_args.timesteps = args.eval_timesteps
-            print(f"\nPhase B: Rollout training (eval horizon: {eval_args.timesteps})")
-            losses_b, psnrs = train_phase_b(model, opt, mse, eval_args, device)
-            visualize_results(model, eval_args, device, mode_name)
+            print(f"\nEvaluating on extended horizon: {eval_args.timesteps} steps")
         else:
-            print("\nPhase B: Rollout training")
-            losses_b, psnrs = train_phase_b(model, opt, mse, args, device)
-            visualize_results(model, args, device, mode_name)
+            eval_args = args
+
+        visualize_results(model, eval_args, device, mode_name)
+
+        if args.mode == 'variable':
+            eval_loss, eval_psnr = evaluate_variable_model(model, eval_args, device)
+            print(f"Evaluation rollout MSE: {eval_loss:.6f}, PSNR: {eval_psnr:.3f} dB")
 
         # Save model
         torch.save(model.state_dict(), output_dir / f'model_{args.mode}.pt')

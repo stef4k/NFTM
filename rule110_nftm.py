@@ -57,23 +57,27 @@ def rule110_rollout(bits0, T, boundary="zeros"):
     rows = [bits0.astype(np.uint8)]
     cur = bits0
     for _ in range(1, T):
-        cur = rule110_next(cur, boundary)
-        rows.append(cur)
-    return np.stack(rows, 0)
+        cur = rule110_next(cur, boundary=boundary)
+        rows.append(cur.astype(np.uint8))
+    return np.stack(rows, axis=0)
 
-# ------------------------------- NFTM components --------------------------------
+
 class StatelessController(nn.Module):
-    """C: neighborhood (3,) -> logit (real). No sigmoid here."""
-    def __init__(self, hidden=64):
+    """Small MLP trained to emulate the Rule 110 truth table."""
+
+    def __init__(self, hidden: int = 64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(3, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, 1)  # logits
+            nn.Linear(3, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 1),
         )
+
     def forward(self, neigh):  # neigh: (B,N,3)
         B, N, _ = neigh.shape
-        logits = self.net(neigh.view(B*N, 3)).view(B, N)  # (B,N)
+        logits = self.net(neigh.view(B * N, 3)).view(B, N)  # (B,N)
         return logits
 
 def read_neighborhoods(field, boundary="zeros"):
@@ -289,16 +293,16 @@ def eval_and_plot(model,
         pil_frames = []
         np_frames = []
         for t in range(1, T + 1):
-            f = plt.figure(figsize=(8, 6))
-            axg = f.add_subplot(1,1,1)
-            axg.imshow(gt[:t, :], cmap="binary", origin="upper", interpolation="nearest")
-            axg.set_title("Rule 110 (ground truth)")
-            axg.set_xlabel("position"); axg.set_ylabel("time")
-            axg.set_xticks([]); axg.set_yticks([])
+            f = plt.figure(figsize=(6, 6))
+            ax = f.add_subplot(1,1,1)
+            ax.imshow(pred_bits[:t, :], cmap="binary", origin="upper", interpolation="nearest")
+            ax.set_title("NFTM rollout")
+            ax.set_xlabel("position"); ax.set_ylabel("time")
+            ax.set_xticks([]); ax.set_yticks([])
             f.tight_layout()
 
             buf = io.BytesIO()
-            f.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            f.savefig(buf, format='png', dpi=100)
             buf.seek(0)
             if Image is not None:
                 pil_frames.append(Image.open(buf).convert('RGB'))
