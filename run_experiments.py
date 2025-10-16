@@ -34,10 +34,10 @@ def run_one(config, script="image_inpainting.py"):
     cmd.append("--save_metrics")
 
     # loss selection
-    loss_mode = config.get("loss", "hetero")
-    cmd += ["--loss", loss_mode]
-    if loss_mode == "homo":
-        cmd += ["--homo_sigma", str(config.get("homo_sigma", 0.1))]
+    # loss_mode = config.get("loss", "hetero")
+    # cmd += ["--loss", loss_mode]
+    # if loss_mode == "homo":
+    #     cmd += ["--homo_sigma", str(config.get("homo_sigma", 0.1))]
 
     # toggles
     cmd += ["--save_dir", save_dir]
@@ -158,7 +158,7 @@ def main():
         print("\n== Summary (final PSNR) ==")
         for m in sorted(results, key=lambda x: x["final_psnr"], reverse=True):
             print(f"{m['name']:<28} final PSNR: {m['final_psnr']:.2f} dB  "
-                  f"[loss={m['loss_mode']}, Keval={m['K_eval']}]")
+                  f"[Keval={m['K_eval']}]")
     else:
         print("No successful runs to summarize.")
 
