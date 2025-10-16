@@ -121,7 +121,6 @@ def _run_nftm_commands(
     epochs: int,
     k_train: int,
     k_eval: int,
-    loss: str,
     device: str,
     seed: int,
     extra_args: List[str],
@@ -142,8 +141,6 @@ def _run_nftm_commands(
             str(k_train),
             "--K_eval",
             str(k_eval),
-            "--loss",
-            loss,
             "--seed",
             str(seed),
             "--device",
@@ -163,7 +160,6 @@ def _run_nftm_commands(
 def _collect_nftm_metrics(
     runs: List[Tuple[str, str]],
     *,
-    loss: str,
     epochs: int,
     k_train: int,
     k_eval: int,
@@ -176,7 +172,6 @@ def _collect_nftm_metrics(
         metrics = _load_metrics(metrics_path)
         row: Dict[str, Any] = {
             "controller": controller,
-            "loss": metrics.get("loss_mode", loss),
             "epochs": metrics.get("epochs", epochs),
             "K_train": metrics.get("K_train", k_train),
             "K_eval": metrics.get("K_eval", k_eval),
@@ -204,7 +199,6 @@ def _write_nftm_summary_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         return
     columns = [
         "controller",
-        "loss",
         "epochs",
         "K_train",
         "K_eval",
@@ -284,7 +278,6 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--include_nftm", action="store_true")
     parser.add_argument("--save_root", type=str, default="runs/inpainting")
     parser.add_argument("--mask_dir", type=str)
-    parser.add_argument("--loss", type=str, default="homo", choices=["homo", "hetero"])
     parser.add_argument("--K_train", type=int, default=None)
     parser.add_argument("--K_eval", type=int, default=None)
     parser.add_argument("--extra", nargs=argparse.REMAINDER, default=[])
@@ -417,7 +410,6 @@ def main(argv: List[str] | None = None) -> None:
                 epochs=nftm_epochs,
                 k_train=nftm_k_train,
                 k_eval=nftm_k_eval,
-                loss=args.loss,
                 device=resolved_device,
                 seed=args.seed,
                 extra_args=list(args.extra),
@@ -458,7 +450,6 @@ def main(argv: List[str] | None = None) -> None:
         try:
             nftm_rows = _collect_nftm_metrics(
                 nftm_runs,
-                loss=args.loss,
                 epochs=nftm_epochs,
                 k_train=nftm_k_train,
                 k_eval=nftm_k_eval,
