@@ -285,7 +285,7 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
                 ax.imshow(((upsampled.permute(1, 2, 0).cpu().numpy()+1)/2).clip(0,1))
                 ax.axis('off')
 
-            gif_cols = min(4, imgs.size(0))
+            gif_cols = min(8, imgs.size(0))
             gif_cols = max(gif_cols, 1)
             gif_gt = imgs[:gif_cols].detach()
 
@@ -612,7 +612,7 @@ def main():
 
     _ = eval_steps(
         controller, test_loader, device,
-        K_eval=min(args.K_eval, 10), beta=beta_eval_final,
+        K_eval=args.K_eval, beta=beta_eval_final,
         p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
         noise_std=args.noise_std, corr_clip=args.corr_clip,
         descent_guard=False, tvw=0.0,
