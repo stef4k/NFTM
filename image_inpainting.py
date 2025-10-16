@@ -36,6 +36,17 @@ def make_transforms():
     # Normalize to [-1,1]
     return T.Compose([T.ToTensor(), T.Normalize(mean=[0.5]*3, std=[0.5]*3)])
 
+def get_transform(benchmark):
+    if benchmark == "cifar":
+        return make_transforms()  # Original CIFAR transform
+    else:
+        # Resize all other datasets to 32×32
+        return T.Compose([
+            T.Resize((32, 32)),
+            T.ToTensor(), 
+            T.Normalize(mean=[0.5]*3, std=[0.5]*3)
+        ])
+
 def random_mask(batch, p_missing=(0.25, 0.5), block_prob=0.5, min_blocks=1, max_blocks=3):
     """Return mask M (1=known, 0=missing). Mix of random pixels and random square blocks."""
     B, C, H, W = batch.shape
@@ -497,6 +508,8 @@ def main():
     parser.add_argument("--contract_w", type=float, default=1e-3, help="contractive penalty weight")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--benchmark", type=str, default="cifar", choices=["cifar", "set12", "cbsd68", "celebahq"],help="choose test dataset for benchmarking"
+)
 
     parser.add_argument("--save_metrics", action="store_true", help="save metrics.json + psnr_curve.npy to save_dir")
 
@@ -507,9 +520,23 @@ def main():
     print(f"[device] {device} | criterion=MSE")
 
     # Data
-    transform = make_transforms()
+    benchmark = args.benchmark.lower()
+    transform = get_transform(benchmark)
     train_set = tv.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
-    test_set  = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+    
+    if benchmark == "cifar":
+        test_set = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+    elif benchmark == "set12":
+        from torchvision.datasets import ImageFolder
+        test_set = ImageFolder(root="./benchmarks/Set12", transform=transform)
+    elif benchmark == "cbsd68":
+        from torchvision.datasets import ImageFolder
+        test_set = ImageFolder(root="./benchmarks/CBSD68", transform=transform)
+    elif benchmark == "celebahq":
+        from torchvision.datasets import ImageFolder
+        test_set = ImageFolder(root="./benchmarks/CelebAHQ", transform=transform)
+    else:
+        raise ValueError(f"Unknown benchmark dataset: {args.benchmark}")
 
     use_cuda_pinning = (device.type == "cuda")
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2,
