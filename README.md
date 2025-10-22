@@ -100,3 +100,33 @@ When the driver finishes, it aggregates results by saving
 
 Failed runs (missing `metrics.json`) are reported in the console log and excluded from the summary artifacts.
 
+
+### Extra Benchmarks for inpainting script
+
+To prepare the datasets for benchmarking, follow the steps below:
+
+1. **Create the Benchmarks Folder**
+   ```bash
+   mkdir -p benchmarks
+
+Then download the datasets:
+
+- CelebAHQ: Download the dataset from [Kaggle](https://www.kaggle.com/datasets/badasstechie/celebahq-resized-256x256), extract and place in `benchmarks/CelebAHQ/all_images/`
+
+- Set12: Download the dataset from [Kaggle](https://www.kaggle.com/datasets/leweihua/set12-231008), extract and place in `benchmarks/Set12/all_images/`
+
+- CBSD68: Download the dataset from [Kaggle](https://www.kaggle.com/datasets/tarekmebrouk/cbsd68), extract and place in `benchmarks/CBSD68/all_images/`
+
+2. **After setup, run benchmarks using:**
+
+   ```bash
+   python image_inpainting.py --benchmark [benchmark_name]
+
+Available benchmark options: `cifar, set12, cbsd68, celebahq`
+
+
+
+
+
+
+
