@@ -19,6 +19,8 @@ from image_inpainting import (
     set_seed,
 )
 from metrics import lpips_dist, param_count, psnr, ssim
+from metrics import (fid_init, fid_update, fid_compute,
+                     kid_init, kid_update, kid_compute)
 from unet_model import TinyUNet
 
 
@@ -177,10 +179,12 @@ def evaluate(model: TinyUNet, loader: DataLoader, device: torch.device, save_dir
         "ssim_all",
         "ssim_miss",
         "lpips_all",
-        "lpips_miss",
+        "lpips_miss"
     ]
     totals = {name: 0.0 for name in metric_names}
     batch_count = 0
+    fid_metric = fid_init(device)
+    kid_metric = kid_init(device)
     sample_saved = False
 
     model.eval()
@@ -201,6 +205,9 @@ def evaluate(model: TinyUNet, loader: DataLoader, device: torch.device, save_dir
             totals["ssim_miss"] += masked_metric_mean(ssim, preds, imgs, miss_mask).item()
             totals["lpips_all"] += lpips_dist(preds, imgs).item()
             totals["lpips_miss"] += masked_metric_mean(lpips_dist, preds, imgs, miss_mask).item()
+            # Accumulate FID/KID features
+            fid_update(fid_metric, imgs, preds)
+            kid_update(kid_metric, imgs, preds)
             batch_count += 1
 
             if not sample_saved:
@@ -210,7 +217,11 @@ def evaluate(model: TinyUNet, loader: DataLoader, device: torch.device, save_dir
     if batch_count == 0:
         raise RuntimeError("Evaluation loader produced no batches.")
 
-    return {name: totals[name] / batch_count for name in metric_names}
+    results = {name: totals[name] / batch_count for name in metric_names}
+    # Compute final FID/KID scores over full test set
+    results["fid"] = fid_compute(fid_metric)
+    results["kid"] = kid_compute(kid_metric)
+    return results
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
@@ -245,6 +256,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         "ssim_miss",
         "lpips_all",
         "lpips_miss",
+        "fid",
+        "kid"
     ]:
         print(f"  {key}: {metrics[key]:.4f}")
 

@@ -12,6 +12,8 @@ import torch
 import torch.nn.functional as F
 import torchvision as tv
 from torchvision.utils import save_image
+from metrics import (fid_init, fid_update, fid_compute,
+                     kid_init, kid_update, kid_compute)
 
 try:  # Prefer shared helpers if available
     from image_inpainting import (
@@ -272,6 +274,8 @@ def run_eval(params: TVL1Params, args: argparse.Namespace) -> Dict[str, float]:
         "lpips_miss": 0.0,
     }
     batch_count = 0
+    fid_metric = fid_init(device)
+    kid_metric = kid_init(device)
     sample_saved = False
 
     for imgs, _ in loader:
@@ -302,6 +306,9 @@ def run_eval(params: TVL1Params, args: argparse.Namespace) -> Dict[str, float]:
         metrics_sum["ssim_miss"] += ssim_miss
         metrics_sum["lpips_all"] += lpips_all
         metrics_sum["lpips_miss"] += lpips_miss
+        # Accumulate FID/KID features
+        fid_update(fid_metric, imgs, I_hat)
+        kid_update(kid_metric, imgs, I_hat)
         batch_count += 1
 
         if not sample_saved:
@@ -323,6 +330,9 @@ def run_eval(params: TVL1Params, args: argparse.Namespace) -> Dict[str, float]:
 
     for key in metrics_sum:
         metrics_sum[key] = metrics_sum[key] / max(batch_count, 1)
+    # Compute final FID/KID scores over full test set
+    metrics_sum["fid"] = fid_compute(fid_metric)
+    metrics_sum["kid"] = kid_compute(kid_metric)
 
     metrics_sum["seed"] = args.seed
     print(

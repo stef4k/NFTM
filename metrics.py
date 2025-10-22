@@ -219,7 +219,7 @@ def fid_update(metric, x, y):
 def fid_compute(metric):
     return metric.compute().item()
 
-def kid_init(device: torch.device, benchmark):
+def kid_init(device: torch.device, benchmark="cifar"):
     # Set parameters subset_size based on benchmark used
     if benchmark == 'set12':
         subset_size = 12
