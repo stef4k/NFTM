@@ -71,6 +71,8 @@ def _pretty_print(summary: Dict[str, Dict[str, float]], methods: Iterable[str]) 
         "ssim_miss",
         "lpips_all",
         "lpips_miss",
+        "fid",
+        "kid"
         "params",
     ]
     header = ["method", *columns]
@@ -187,6 +189,8 @@ def _collect_nftm_metrics(
             "ssim_miss",
             "lpips_all",
             "lpips_miss",
+            "fid",
+            "kid",
             "runtime_ms_per_image",
         ]:
             row[key] = metrics.get(key)
@@ -210,6 +214,8 @@ def _write_nftm_summary_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         "ssim_miss",
         "lpips_all",
         "lpips_miss",
+        "fid",
+        "kid",
         "runtime_ms_per_image",
         "final_psnr",
         "save_dir",
@@ -234,6 +240,8 @@ def _print_nftm_table(rows: List[Dict[str, Any]]) -> None:
         "ssim_miss",
         "lpips_all",
         "lpips_miss",
+        "fid",
+        "kid",
         "final_psnr",
     ]
     widths = [len(col) for col in columns]
