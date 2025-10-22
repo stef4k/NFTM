@@ -219,10 +219,17 @@ def fid_update(metric, x, y):
 def fid_compute(metric):
     return metric.compute().item()
 
-def kid_init(device: torch.device):
+def kid_init(device: torch.device, benchmark):
+    # Set parameters subset_size based on benchmark used
+    if benchmark == 'set12':
+        subset_size = 12
+    elif benchmark == 'cbsd68':
+        subset_size = 84
+    else:
+        subset_size = 1000 #default value
     if not _FID_AVAILABLE:
         raise RuntimeError("KID requires torchmetrics.")
-    metric = KernelInceptionDistance(normalize=True).to(device)
+    metric = KernelInceptionDistance(normalize=True, subset_size=subset_size).to(device)
     return metric
 
 def kid_update(metric, x, y):

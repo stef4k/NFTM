@@ -395,6 +395,7 @@ def evaluate_metrics_full(
     corr_clip=0.2,
     descent_guard: bool = False,
     tvw: float = 0.0,
+    benchmark
 ):
     controller.eval()
     totals = {
@@ -407,7 +408,7 @@ def evaluate_metrics_full(
     }
     batches = 0
     fid_metric = fid_init(device)
-    kid_metric = kid_init(device)
+    kid_metric = kid_init(device, benchmark=benchmark)
 
     for imgs, _ in loader:
         imgs = imgs.to(device, non_blocking=True)
@@ -662,6 +663,7 @@ def main():
             corr_clip=args.corr_clip,
             descent_guard=False,
             tvw=0.0,
+            benchmark=benchmark
         )
         if psnr_curve is not None and psnr_curve.size > 0:
             np.save(os.path.join(args.save_dir, "psnr_curve.npy"), psnr_curve)
