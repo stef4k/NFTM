@@ -72,7 +72,7 @@ def _pretty_print(summary: Dict[str, Dict[str, float]], methods: Iterable[str]) 
         "lpips_all",
         "lpips_miss",
         "fid",
-        "kid"
+        "kid",
         "params",
     ]
     header = ["method", *columns]
