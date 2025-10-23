@@ -79,7 +79,7 @@ def run_one(config, script="image_inpainting.py"):
 
 
 def plot_curves(all_metrics, out_png):
-    plt.figure(figsize=(7,5))
+    plt.figure(figsize=(8,5))
     for m in all_metrics:
         curve = m.get("curve", [])
         if not curve:
@@ -94,7 +94,14 @@ def plot_curves(all_metrics, out_png):
     plt.ylabel("PSNR (dB)")
     plt.title("Step-wise PSNR — Ablations")
     plt.grid(True, alpha=0.3)
-    plt.legend()
+    # legend outside plot
+    plt.legend(
+        loc='center left',
+        bbox_to_anchor=(1, 0.5),
+        fontsize=8,
+        frameon=False
+    )
+    plt.tight_layout()
     ensure_dir(os.path.dirname(out_png) or ".")
     plt.savefig(out_png, dpi=160, bbox_inches="tight")
     print(f"[plot] saved comparison curves -> {out_png}")
