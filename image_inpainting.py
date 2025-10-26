@@ -10,6 +10,8 @@
 import os, random, argparse, json, numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data import random_split
+from torchvision.datasets import ImageFolder
 import torchvision as tv
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
@@ -32,17 +34,15 @@ def set_seed(seed: int):
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
-def make_transforms():
-    # Normalize to [-1,1]
-    return T.Compose([T.ToTensor(), T.Normalize(mean=[0.5]*3, std=[0.5]*3)])
 
-def get_transform(benchmark):
+def get_transform(benchmark, img_size=32):
     if benchmark == "cifar":
-        return make_transforms()  # Original CIFAR transform
+        # Normalize to [-1,1] - no resizing needed
+        return T.Compose([T.ToTensor(), T.Normalize(mean=[0.5]*3, std=[0.5]*3)])
     else:
-        # Resize all other datasets to 32×32
+        # Resize other datasets to img_size x img_size
         return T.Compose([
-            T.Resize((32, 32)),
+            T.Resize((img_size, img_size)),
             T.ToTensor(), 
             T.Normalize(mean=[0.5]*3, std=[0.5]*3)
         ])
@@ -509,8 +509,9 @@ def main():
     parser.add_argument("--contract_w", type=float, default=1e-3, help="contractive penalty weight")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--benchmark", type=str, default="cifar", choices=["cifar", "set12", "cbsd68", "celebahq"],help="choose test dataset for benchmarking"
-)
+    parser.add_argument("--benchmark", type=str, default="cifar", choices=["cifar", "set12", "cbsd68", "celebahq"],help="choose test dataset for benchmarking")
+    parser.add_argument("--train_dataset", type=str, default="cifar", choices=["cifar", "celebahq"], help="Dataset for training")
+    parser.add_argument("--img_size", type=int, default=32, choices=[32, 64], help="Input image size (resize if necessary)")
 
     parser.add_argument("--save_metrics", action="store_true", help="save metrics.json + psnr_curve.npy to save_dir")
 
@@ -521,21 +522,35 @@ def main():
     print(f"[device] {device} | criterion=MSE")
 
     # Data
+    train_dataset_name = args.train_dataset.lower()
+    img_size = args.img_size
     benchmark = args.benchmark.lower()
-    transform = get_transform(benchmark)
-    train_set = tv.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
     
+    # Set training dataset
+    if train_dataset_name == "cifar":
+        transform_train = get_transform("cifar", img_size=img_size)
+        train_set = tv.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform_train)
+    elif train_dataset_name == "celebahq":
+        transform_train = get_transform("celebahq", img_size=img_size)
+        train_set = ImageFolder(root="./benchmarks/CelebAHQ/", transform=transform_train)
+    else:
+        raise ValueError(f"Unknown train dataset: {args.train_dataset}")
+    
+    transform_test = get_transform(benchmark, img_size=img_size)
+    # Set test dataset
     if benchmark == "cifar":
-        test_set = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+        test_set = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
     elif benchmark == "set12":
-        from torchvision.datasets import ImageFolder
-        test_set = ImageFolder(root="./benchmarks/Set12", transform=transform)
+        test_set = ImageFolder(root="./benchmarks/Set12", transform=transform_test)
     elif benchmark == "cbsd68":
-        from torchvision.datasets import ImageFolder
-        test_set = ImageFolder(root="./benchmarks/CBSD68", transform=transform)
+        test_set = ImageFolder(root="./benchmarks/CBSD68", transform=transform_test)
+    elif (benchmark == "celebahq") and train_dataset_name == "celebahq":
+        # Random split 80-20 for train and test set
+        train_size = int(0.8 * len(train_set))
+        test_size = len(train_set) - train_size
+        train_set, test_set = random_split(train_set, [train_size, test_size], generator=torch.Generator().manual_seed(42))
     elif benchmark == "celebahq":
-        from torchvision.datasets import ImageFolder
-        test_set = ImageFolder(root="./benchmarks/CelebAHQ", transform=transform)
+        test_set = ImageFolder(root="./benchmarks/CelebAHQ", transform=transform_test)
     else:
         raise ValueError(f"Unknown benchmark dataset: {args.benchmark}")
 
