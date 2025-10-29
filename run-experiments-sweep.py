@@ -21,6 +21,7 @@ def _forwardable_keys():
         "corr_clip","tv_weight","pmin","pmax","block_prob",
         "noise_std","width","controller","unet_base",
         "contract_w","seed","device","benchmark",
+        "train_dataset","img_size",
     ]
 
 def run_one(config, script="image_inpainting.py"):
@@ -135,7 +136,7 @@ def save_csv(all_metrics, out_csv):
     print(f"[csv] saved summary -> {out_csv}")
 
 
-def _make_grid(runs_dir, epochs):
+def _make_grid(runs_dir, epochs, overrides=None):
     """
     Build a compact but useful grid:
       - controllers: dense, unet
@@ -159,9 +160,14 @@ def _make_grid(runs_dir, epochs):
         seed=0,
         device="cuda", # defaults to cuda if available
         benchmark="cifar", # for now, might be interesting to try others once we have GPU access
+        train_dataset="cifar",
+        img_size=32,
         save_epoch_progress=False,
         guard_in_train=False,
     )
+
+    if overrides:
+        base.update({k: v for k, v in overrides.items() if v is not None})
 
     controllers = ["dense", "unet"]
     schedule_variants = [
@@ -212,6 +218,92 @@ def _make_grid(runs_dir, epochs):
     return runs
 
 
+def _make_recipe_incremental(runs_dir, epochs, overrides=None):
+
+    """
+    Staged, interpretable recipe:
+      S0: minimal baselines (no tv, no contract, no guard) for both controllers.
+      S1: add ONE trick at a time: +tv | +contract | +guard (each alone).
+      S2: pairwise interactions: tv+contract | tv+guard | contract+guard.
+      S3: all three.
+      S4: small schedule/clipping probes on the full combo.
+    """
+    base = dict(
+        epochs=epochs,
+        batch_size=128,
+        K_train=8,
+        K_eval=12,
+        beta_start=0.28, beta_max=0.6, beta_anneal=0.03, beta_eval_bonus=0.05,
+        corr_clip=0.10,
+        tv_weight=0.0,                # <- start with NO TV
+        contract_w=0.0,               # <- start with NO contract
+        pmin=0.25, pmax=0.50, block_prob=0.5,
+        noise_std=0.3,
+        width=48,
+        seed=0,
+        device="cuda",
+        benchmark="cifar",
+        train_dataset="cifar",
+        img_size=32,
+        save_epoch_progress=False,
+        guard_in_train=False,         # <- start with NO guard
+    )
+
+    if overrides:
+        base.update({k: v for k, v in overrides.items() if v is not None})
+
+    runs = []
+    controllers = ["dense", "unet"]
+
+    for ctrl in controllers:
+        # S0: baseline
+        cfg0 = {**base, "controller": ctrl}
+        cfg0["name"] = f"s0_{ctrl}_baseline"
+        cfg0["save_dir"] = os.path.join(runs_dir, cfg0["name"])
+        runs.append(cfg0)
+
+        # S1: single tricks
+        singles = [
+            ("tv",        dict(tv_weight=0.01)),
+            ("contract",  dict(contract_w=1e-3)),
+            ("guard",     dict(guard_in_train=True)),
+        ]
+        for tag, upd in singles:
+            cfg = {**base, "controller": ctrl, **upd}
+            cfg["name"] = f"s1_{ctrl}_+{tag}"
+            cfg["save_dir"] = os.path.join(runs_dir, cfg["name"])
+            runs.append(cfg)
+
+        # S2: pairwise combos
+        pairs = [
+            ("tv_contract", dict(tv_weight=0.01, contract_w=1e-3)),
+            ("tv_guard",    dict(tv_weight=0.01, guard_in_train=True)),
+            ("contract_guard", dict(contract_w=1e-3, guard_in_train=True)),
+        ]
+        for tag, upd in pairs:
+            cfg = {**base, "controller": ctrl, **upd}
+            cfg["name"] = f"s2_{ctrl}_+{tag}"
+            cfg["save_dir"] = os.path.join(runs_dir, cfg["name"])
+            runs.append(cfg)
+
+        # S3: all three
+        cfg3 = {**base, "controller": ctrl, "tv_weight": 0.01, "contract_w": 1e-3, "guard_in_train": True}
+        cfg3["name"] = f"s3_{ctrl}_+tv_contract_guard"
+        cfg3["save_dir"] = os.path.join(runs_dir, cfg3["name"])
+        runs.append(cfg3)
+
+        # S4: schedule and clip probes on the full combo
+        scheds = [("default", 0.28, 0.03), ("slow", 0.20, 0.02)]
+        for stag, b0, db in scheds:
+            for clip in [0.10, 0.08]:
+                cfg4 = {**cfg3, "beta_start": b0, "beta_anneal": db, "corr_clip": clip}
+                cfg4["name"] = f"s4_{ctrl}_{stag}_clip{str(clip).replace('.','p')}"
+                cfg4["save_dir"] = os.path.join(runs_dir, cfg4["name"])
+                runs.append(cfg4)
+
+    return runs
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--script", type=str, default="image_inpainting.py",
@@ -219,13 +311,39 @@ def main():
     ap.add_argument("--runs_dir", type=str, default="runs/sweep",
                     help="where to save experiment subfolders")
     ap.add_argument("--epochs", type=int, default=8, help="epochs per run")
+    ap.add_argument("--recipe", type=str, default="incremental",
+                choices=["incremental", "grid"])
+    ap.add_argument("--img_size", type=int, default=32, choices=[32, 64])
+    ap.add_argument("--train_dataset", type=str, default="cifar",
+                    choices=["cifar", "celebahq"])
+    ap.add_argument("--benchmark", type=str, default="cifar",
+                    choices=["cifar", "set12", "cbsd68", "celebahq"])
+    ap.add_argument("--save_epoch_progress", action="store_true",
+                help="save per-epoch step grids/GIFs for the first eval batch")
+    ap.add_argument("--guard_in_train", action="store_true",
+                    help="force descent guard during training for all runs")
     args = ap.parse_args()
 
     runs_dir = args.runs_dir
     ensure_dir(runs_dir)
 
-    # Build experiment grid
-    experiments = _make_grid(runs_dir, epochs=args.epochs)
+    # Build experiments from chosen recipe
+    overrides = dict(
+        img_size=args.img_size,
+        train_dataset=args.train_dataset,
+        benchmark=args.benchmark,
+        save_epoch_progress=args.save_epoch_progress,
+    )
+
+    if args.recipe == "grid":
+        overrides["guard_in_train"] = args.guard_in_train
+    elif args.guard_in_train:
+        print("[warn] --guard_in_train is ignored for --recipe incremental to preserve staged ablations.")
+
+    if args.recipe == "grid":
+        experiments = _make_grid(runs_dir, epochs=args.epochs, overrides=overrides)
+    else:
+        experiments = _make_recipe_incremental(runs_dir, epochs=args.epochs, overrides=overrides)
 
     # -------- Run all --------
     results = []
