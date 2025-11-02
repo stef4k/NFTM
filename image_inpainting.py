@@ -26,6 +26,7 @@ from metrics import ssim as _metric_ssim
 from metrics import (fid_init, fid_update, fid_compute,
                      kid_init, kid_update, kid_compute)
 from unet_model import TinyUNet
+import wandb
 
 # -------------------------- Utilities --------------------------
 
@@ -514,11 +515,14 @@ def main():
     parser.add_argument("--img_size", type=int, default=32, choices=[32, 64], help="Input image size (resize if necessary)")
 
     parser.add_argument("--save_metrics", action="store_true", help="save metrics.json + psnr_curve.npy to save_dir")
+    parser.add_argument("--use_wandb", action="store_true", help="enable logging to Weights & Biases (wandb)")
+
 
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = torch.device(args.device)
+    log_with_wandb = args.use_wandb
     print(f"[device] {device} | criterion=MSE")
 
     # Data
@@ -637,6 +641,19 @@ def main():
         print(msg)
         if args.guard_in_train:
             print(f"         accepted steps: {stats['accepted']} | backtracks (approx): {stats['backtracks']}")
+        # Log metrics to Weights & Biases
+        if log_with_wandb:
+            wandb.log({
+                "epoch": ep,
+                "train/loss": train_loss,
+                "train/psnr": train_psnr,
+                "eval/psnr_final": float(psnr_curve[-1]) if psnr_curve.size > 0 else None,
+                "eval/ssim_final": float(ssim_curve[-1]) if ssim_curve.size > 0 else None,
+                "eval/lpips_final": float(lpips_curve[-1]) if lpips_curve.size > 0 else None,
+                "beta": beta,
+                "K_train": stats["train_K"],
+                "controller": args.controller,
+            })
 
     # Save final metric curves
     if psnr_curve is not None and psnr_curve.size > 0:
@@ -718,6 +735,17 @@ def main():
         with open(os.path.join(args.save_dir, "metrics.json"), "w") as f:
             json.dump(summary, f, indent=2)
         print(f"[metrics] saved metrics.json & psnr_curve.npy in {args.save_dir} | controller={args.controller}")
+    if log_with_wandb:
+    # Finish logging
+        wandb.log({
+            "final/psnr": summary.get("final_psnr"),
+            "final/ssim": summary.get("final_ssim"),
+            "final/lpips": summary.get("final_lpips"),
+            "final/fid": summary.get("fid"),
+            "final/kid": summary.get("kid"),
+            "params": param_total,
+        })
+        wandb.finish()
 
 if __name__ == "__main__":
     main()
