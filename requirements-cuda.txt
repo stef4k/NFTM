@@ -11,3 +11,4 @@ pytorch-msssim>=1.0.0
 lpips>=0.1.4
 tqdm>=4.66
 pandas>=2.1
+wandb>=0.22.2
