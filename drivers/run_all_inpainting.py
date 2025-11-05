@@ -71,6 +71,7 @@ def _pretty_print(summary: Dict[str, Dict[str, float]], methods: Iterable[str]) 
         "ssim_miss",
         "lpips_all",
         "lpips_miss",
+        "kid",
         "params",
     ]
     header = ["method", *columns]
@@ -281,10 +282,21 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument(
         "--device", type=str, default="auto", choices=["auto", "cpu", "cuda"]
     )
+    parser.add_argument("--beta_start", type=float, default=0.28, help="initial beta (step size)")
+    parser.add_argument("--beta_max", type=float, default=0.6, help="cap on beta during training")
+    parser.add_argument("--beta_anneal", type=float, default=0.03, help="per-epoch beta increment")
+    parser.add_argument("--beta_eval_bonus", type=float, default=0.05, help="extra beta for eval")
+    parser.add_argument("--corr_clip", type=float, default=0.1, help="max per-step correction magnitude (base)")
+    parser.add_argument("--pmin", type=float, default=0.25, help="min missing fraction")
+    parser.add_argument("--pmax", type=float, default=0.5, help="max missing fraction")
+    parser.add_argument("--block_prob", type=float, default=0.5, help="probability to add random occlusion blocks")
+    parser.add_argument("--noise_std", type=float, default=0.3, help="corruption noise std for missing pixels")
+    parser.add_argument("--width", type=int, default=48, help="controller width")
+    parser.add_argument("--save_metrics", action="store_true", help="save metrics.json + psnr_curve.npy to save_dir")
+    parser.add_argument("--save_dir", type=str, default="runs")
     parser.add_argument("--include_nftm", action="store_true")
     parser.add_argument("--save_root", type=str, default="runs/inpainting")
     parser.add_argument("--mask_dir", type=str)
-    parser.add_argument("--loss", type=str, default="homo", choices=["homo", "hetero"])
     parser.add_argument("--K_train", type=int, default=None)
     parser.add_argument("--K_eval", type=int, default=None)
     parser.add_argument("--extra", nargs=argparse.REMAINDER, default=[])
@@ -309,6 +321,8 @@ def main(argv: List[str] | None = None) -> None:
         "unet": os.path.join(base_dir, "unet"),
         "unet_eval": os.path.join(base_dir, "unet_eval"),
         "tvl1": os.path.join(base_dir, "tvl1"),
+        "unet_recursive": os.path.join(base_dir, "unet_recursive"),
+        "unet_recursive_eval": os.path.join(base_dir, "unet_recursive_eval"),
     }
     if args.include_nftm:
         dirs["nftm"] = os.path.join(base_dir, "nftm")
@@ -367,6 +381,57 @@ def main(argv: List[str] | None = None) -> None:
                 resolved_device,
             ],
         )
+
+        _run_stage(
+            "train_unet_recur",
+            [
+                py_executable,
+                "train_unet_recur.py",
+                "--epochs",
+                str(baseline_epochs),
+                "--batch_size",
+                str(args.batch_size),
+                "--lr",
+                str(args.lr),
+                "--weight_decay",
+                str(args.wd),
+                "--tv_weight",
+                str(args.tv_weight),
+                "--seed",
+                str(args.seed),
+                "--save_dir",
+                dirs["unet_recursive"],
+                "--base",
+                str(args.unet_base),
+                "--target_params",
+                str(args.target_params),
+                "--num_workers",
+                str(args.num_workers),
+                "--device",
+                resolved_device,
+            ],
+        )
+
+        _run_stage(
+            "eval_unet_recur",
+            [
+                py_executable,
+                "eval_unet_recur.py",
+                "--ckpt",
+                os.path.join(dirs["unet_recursive"], "ckpt.pt"),
+                "--batch_size",
+                str(args.batch_size),
+                "--num_workers",
+                str(args.num_workers),
+                "--seed",
+                str(args.seed),
+                "--save_dir",
+                dirs["unet_recursive_eval"],
+                "--device",
+                resolved_device,
+            ],
+        )
+
 
         _run_stage(
             "tvl1_baseline",
@@ -431,6 +496,7 @@ def main(argv: List[str] | None = None) -> None:
     summary: Dict[str, Dict[str, float]] = {}
     try:
         summary["unet"] = _load_metrics(os.path.join(dirs["unet_eval"], "metrics.json"))
+        summary["unet_recursive"] = _load_metrics(os.path.join(dirs["unet_recursive_eval"], "metrics.json"))
         summary["tvl1"] = _load_metrics(os.path.join(dirs["tvl1"], "metrics.json"))
         if args.include_nftm and "nftm" in dirs:
             summary["nftm"] = _load_metrics(os.path.join(dirs["nftm"], "metrics.json"))
@@ -452,7 +518,7 @@ def main(argv: List[str] | None = None) -> None:
         json.dump(summary, fp, indent=2)
     print(f"[info] summary written to {summary_path}")
 
-    _pretty_print(summary, ["unet", "tvl1", "nftm"])
+    _pretty_print(summary, ["unet","unet_recursive", "tvl1", "nftm"])
 
     if args.include_nftm and nftm_runs:
         try:
