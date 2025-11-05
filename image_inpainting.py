@@ -135,6 +135,70 @@ def upsample_for_viz(x: torch.Tensor, scale: float) -> torch.Tensor:
     else:
         return F.interpolate(x, scale_factor=scale, mode='bilinear', align_corners=False)
 
+# NEW: scale helpers
+def downsample_like(x: torch.Tensor, size: int) -> torch.Tensor:
+    return F.interpolate(x, size=(size, size), mode='bilinear', align_corners=False)
+
+def upsample_like(x: torch.Tensor, size: int) -> torch.Tensor:
+    return F.interpolate(x, size=(size, size), mode='bilinear', align_corners=False)
+
+def downsample_mask_minpool(mask: torch.Tensor, size: int) -> torch.Tensor:
+    """Keep 'unknown' (0) dominant when shrinking: min-pool in practice via -maxpool(-mask)."""
+    B, C, H, W = mask.shape  # C==1
+    if H == size and W == size:
+        return mask
+    # compute stride/ks for power-of-two downs
+    factor = H // size
+    if (H % size) == 0 and (W % size) == 0 and factor >= 2:
+        m = -F.max_pool2d(-mask, kernel_size=factor, stride=factor)
+    else:
+        # fallback: bilinear then threshold (keeps hard 0 where any 0 existed)
+        m = F.interpolate(mask, size=(size, size), mode='bilinear', align_corners=False)
+        m = (m > 0.999).float()
+    return m
+
+# --- Pyramid parsing & step allocation ---
+
+def parse_pyramid_arg(pyr: str, final_size: int):
+    """Return an increasing list of sizes ending at final_size."""
+    if not pyr:
+        return [final_size]
+    sizes = [int(s) for s in pyr.split(",") if s.strip()]
+    sizes = sorted(set([s for s in sizes if 8 <= s <= final_size]))
+    if not sizes or sizes[-1] != final_size:
+        sizes.append(final_size)
+    return sizes
+
+def split_steps_eval(K_total: int, sizes, steps_arg: str | None = None):
+    """Steps per level for eval (sum to K_total). If not provided, give 1 to each coarse, rest to finest."""
+    if len(sizes) == 1:
+        return [K_total]
+    if steps_arg:
+        steps = [int(s) for s in steps_arg.split(",") if s.strip()]
+        assert sum(steps) == K_total and len(steps) == len(sizes), "pyr_steps must match pyramid and sum to K_eval"
+        return steps
+    L = len(sizes)
+    steps = [1]*(L-1) + [K_total - (L-1)]
+    steps[-1] = max(steps[-1], 1)
+    return steps
+
+def split_steps_train(K_curr: int, sizes, epoch: int):
+    """Steps per level for training curriculum; a bit more coarse in very early epochs."""
+    if len(sizes) == 1:
+        return [K_curr]
+    coarse_each = 2 if (epoch <= 2 and K_curr >= 3) else 1
+    L = len(sizes)
+    total_coarse = min(coarse_each*(L-1), K_curr-1)
+    steps = [coarse_each]*(L-1) + [K_curr - total_coarse]
+    # Clamp to >=1 and fix any rounding drift
+    for i in range(L-1):
+        if steps[i] < 1:
+            steps[i] = 1
+    steps[-1] = max(steps[-1], 1)
+    diff = K_curr - sum(steps)
+    steps[-1] += diff
+    return steps
+
 # -------------------------- Model --------------------------
 
 class TinyController(nn.Module):
@@ -215,15 +279,15 @@ def nftm_step_guarded(I, I_gt, M, controller, beta, corr_clip=0.2, tvw=0.01,
 # -------------------------- Train / Eval --------------------------
 
 def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
-                beta=0.4, tvw=0.01, p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
-                corr_clip=0.2, guard_in_train=True,
-                contract_w=1e-3, rollout_bias=True):
+                beta=0.4, beta_max=0.6, tvw=0.01, p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
+                corr_clip=0.2, guard_in_train=True, contract_w=1e-3, rollout_bias=True, pyramid_sizes=None):
     controller.train()
     psnrs, losses = [], []
     accepted_steps, backtracks = 0, 0
 
     # curriculum on rollout depth: grow K_train with epochs
     K_train = min(K_target, K_base + epoch)
+    sizes_default = pyramid_sizes if pyramid_sizes else None
 
     for imgs, _ in loader:
         imgs = imgs.to(device, non_blocking=True)  # ground truth in [-1,1]
@@ -236,26 +300,49 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
             lengths = list(range(1, K_train+1))
             weights = torch.tensor([0.6*(0.7**(t-1)) for t in lengths])
             weights = (weights / weights.sum()).to(device='cpu')
-            t = int(torch.multinomial(weights, 1).item() + 1) - 0  # 1..K_train
+            K_curr = int(torch.multinomial(weights, 1).item() + 1)  # 1..K_train
         else:
-            t = random.randint(1, K_train)
+            K_curr = random.randint(1, K_train)
 
+        sizes = sizes_default or [imgs.shape[-1]]
+        steps_per = split_steps_train(K_curr, sizes, epoch=epoch)
+
+        I = clamp_known(I0.clone(), imgs, M)
         I_prev_for_contract = I.clone().detach()
 
-        for s in range(t):
-            clip_decay = (0.92 ** s)  # slightly tighter clipping at later steps
-            if guard_in_train:
-                I, _, _used_beta, ok, _dE = nftm_step_guarded(
-                    I, imgs, M, controller, beta=beta, corr_clip=corr_clip,
-                    tvw=0.0, max_backtracks=2, shrink=0.5, clip_decay=clip_decay
-                )
-                accepted_steps += int(ok)
-                backtracks += int(not ok)
-            else:
-                I, _ = nftm_step(I, imgs, M, controller, beta=beta,
-                                 corr_clip=corr_clip, clip_decay=clip_decay)
+        for lvl, (S, T) in enumerate(zip(sizes, steps_per)):
+            gt_S = imgs if S == imgs.shape[-1] else downsample_like(imgs, S)
+            M_S = M if S == imgs.shape[-1] else downsample_mask_minpool(M, S)
+            I = I if I.shape[-1] == S else downsample_like(I, S)
 
-        # Data loss
+            scale_fac = float(sizes[-1]) / float(S)
+            beta_S = min(beta * scale_fac, beta_max)
+            corr_clip_S = corr_clip * scale_fac
+
+            for s in range(T):
+                clip_decay = (0.92 ** s)
+                if guard_in_train:
+                    I, _, _used_beta, ok, _dE = nftm_step_guarded(
+                        I, gt_S, M_S, controller,
+                        beta=beta_S, corr_clip=corr_clip_S,
+                        tvw=0.0, max_backtracks=2, shrink=0.5, clip_decay=clip_decay
+                    )
+                    accepted_steps += int(ok)
+                    backtracks += int(not ok)
+                else:
+                    I, _ = nftm_step(
+                        I, gt_S, M_S, controller,
+                        beta=beta_S, corr_clip=corr_clip_S, clip_decay=clip_decay
+                    )
+
+            if S != sizes[-1]:
+                nextS = sizes[lvl+1]
+                I = upsample_like(I, nextS)
+                gt_next = imgs if nextS == imgs.shape[-1] else downsample_like(imgs, nextS)
+                M_next  = M if nextS == M.shape[-1] else downsample_mask_minpool(M, nextS)
+                I = clamp_known(I, gt_next, M_next)
+
+        # Loss on final fine output
         data_loss = F.mse_loss(I, imgs)
 
         # Regularizers
@@ -280,7 +367,8 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
 def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
                p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
                corr_clip=0.2, descent_guard=False, tvw=0.0,
-               save_per_epoch_dir=None, epoch_tag=None, viz_scale: float = 1.0):
+               save_per_epoch_dir=None, epoch_tag=None, pyramid_sizes=None, 
+               steps_split=None, viz_scale: float = 1.0):
     controller.eval()
     psnrs_step, ssims_step, lpips_step = [], [], []
     # optional per-epoch visualization of first batch progression
@@ -339,33 +427,66 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
                 if init_frame is not None:
                     gif_frames.append(init_frame)
 
-        for s in range(K_eval):
-            clip_decay = (0.92 ** s)
-            if descent_guard:
-                I, _, _used_beta, ok, _dE = nftm_step_guarded(
-                    I, imgs, M, controller, beta=beta, corr_clip=corr_clip,
-                    tvw=tvw, max_backtracks=3, shrink=0.5,
-                    clip_decay=clip_decay
-                )
-            else:
-                I, _ = nftm_step(I, imgs, M, controller, beta=beta,
-                                 corr_clip=corr_clip, clip_decay=clip_decay)
-            I_metrics = I.clamp(-1.0, 1.0)
-            step_psnrs.append(_metric_psnr(I_metrics, imgs).item())
-            step_ssims.append(_metric_ssim(I_metrics, imgs).item())
-            step_lpips.append(_metric_lpips(I_metrics, imgs).item())
-            if save_seq and bidx == 0 and imageio is not None and make_gif_frame is not None:
-                frame = make_gif_frame(I_metrics)
-                if frame is not None:
-                    gif_frames.append(frame)
+        # BEFORE (conceptually):
+        # for s in range(K_eval): step at native resolution
 
-            if save_seq and bidx == 0:
-                vis_rows = min(6, imgs.size(0))
-                cols = K_eval + 2
-                for r in range(vis_rows):
-                    ax = plt.subplot(vis_rows, cols, r*cols + (s+3))
-                    show_img(ax, I[r])
-                    if r==0: ax.set_title(f"step {s+1}")
+        # --- Multi-scale rollout (fills per-step curves) ---
+        sizes = pyramid_sizes or [imgs.shape[-1]]
+        steps_per = steps_split or split_steps_eval(K_eval, sizes)
+
+        I = clamp_known(I0.clone(), imgs, M)
+        total_steps = 0  # to ensure we produce exactly K_eval entries
+
+        for lvl, (S, T) in enumerate(zip(sizes, steps_per)):
+            gt_S = imgs if S == imgs.shape[-1] else downsample_like(imgs, S)
+            M_S = M if S == imgs.shape[-1] else downsample_mask_minpool(M, S)
+            I = I if I.shape[-1] == S else downsample_like(I, S)
+
+            scale_fac = float(sizes[-1]) / float(S)
+            beta_S = min(beta * scale_fac, 0.9)
+            corr_clip_S = corr_clip * scale_fac
+
+            for s in range(T):
+                clip_decay = (0.92 ** s)
+                if descent_guard:
+                    I, _, _, _, _ = nftm_step_guarded(
+                        I, gt_S, M_S, controller, beta=beta_S, corr_clip=corr_clip_S,
+                        tvw=tvw, max_backtracks=3, shrink=0.5, clip_decay=clip_decay
+                    )
+                else:
+                    I, _ = nftm_step(I, gt_S, M_S, controller, beta=beta_S,
+                                     corr_clip=corr_clip_S, clip_decay=clip_decay)
+                    
+                if save_seq and bidx == 0:
+                    vis_rows = min(6, imgs.size(0))
+                    cols = K_eval + 2
+                    show_tensor = I if I.shape[-1] == imgs.shape[-1] else upsample_like(I, imgs.shape[-1])
+                    for r in range(vis_rows):
+                        ax = plt.subplot(vis_rows, cols, r*cols + (total_steps + 3))
+                        show_img(ax, show_tensor[r])
+                        if r == 0:
+                            ax.set_title(f"step {total_steps+1}")
+
+                # --- per-step metrics at native size ---
+                I_metrics = I if I.shape[-1] == imgs.shape[-1] else upsample_like(I, imgs.shape[-1])
+                I_metrics = I_metrics.clamp(-1.0, 1.0)
+                step_psnrs.append(_metric_psnr(I_metrics, imgs).item())
+                step_ssims.append(_metric_ssim(I_metrics, imgs).item())
+                step_lpips.append(_metric_lpips(I_metrics, imgs).item())
+                total_steps += 1
+
+                if save_seq and bidx == 0 and imageio is not None and make_gif_frame is not None:
+                    frame = make_gif_frame(I_metrics)
+                    if frame is not None:
+                        gif_frames.append(frame)
+
+            if S != sizes[-1]:
+                nextS = sizes[lvl+1]
+                I = upsample_like(I, nextS)
+                gt_next = imgs if nextS == imgs.shape[-1] else downsample_like(imgs, nextS)
+                M_next  = M if nextS == M.shape[-1] else downsample_mask_minpool(M, nextS)
+                I = clamp_known(I, gt_next, M_next)
+
 
         psnrs_step.append(step_psnrs)
         ssims_step.append(step_ssims)
@@ -407,7 +528,9 @@ def evaluate_metrics_full(
     corr_clip=0.2,
     descent_guard: bool = False,
     tvw: float = 0.0,
-    benchmark
+    benchmark=None,
+    pyramid_sizes=None,
+    steps_split=None,
 ):
     controller.eval()
     totals = {
@@ -424,38 +547,45 @@ def evaluate_metrics_full(
 
     for imgs, _ in loader:
         imgs = imgs.to(device, non_blocking=True)
-        mask_known = random_mask(imgs, p_missing=p_missing, block_prob=block_prob).to(device)
-        corrupted = corrupt_images(imgs, mask_known, noise_std=noise_std)
-        I = clamp_known(corrupted.clone(), imgs, mask_known)
+        M = random_mask(imgs, p_missing=p_missing, block_prob=block_prob).to(device)
+        I0 = corrupt_images(imgs, M, noise_std=noise_std)
 
-        for step in range(K_eval):
-            clip_decay = 0.92 ** step
-            if descent_guard:
-                I, _, _, _, _ = nftm_step_guarded(
-                    I,
-                    imgs,
-                    mask_known,
-                    controller,
-                    beta=beta,
-                    corr_clip=corr_clip,
-                    tvw=tvw,
-                    max_backtracks=3,
-                    shrink=0.5,
-                    clip_decay=clip_decay,
-                )
-            else:
-                I, _ = nftm_step(
-                    I,
-                    imgs,
-                    mask_known,
-                    controller,
-                    beta=beta,
-                    corr_clip=corr_clip,
-                    clip_decay=clip_decay,
-                )
+        # multi-scale rollout, same as eval_steps()
+        sizes = pyramid_sizes or [imgs.shape[-1]]
+        steps_per = steps_split or split_steps_eval(K_eval, sizes)
+
+        I = clamp_known(I0.clone(), imgs, M)
+
+        for lvl, (S, T) in enumerate(zip(sizes, steps_per)):
+            gt_S = imgs if S == imgs.shape[-1] else downsample_like(imgs, S)
+            M_S  = M if S == imgs.shape[-1] else downsample_mask_minpool(M, S)
+            I    = I if I.shape[-1] == S else downsample_like(I, S)
+
+            scale_fac = float(sizes[-1]) / float(S)
+            beta_S = min(beta * scale_fac, 0.9)
+            corr_clip_S = corr_clip * scale_fac
+
+            for s in range(T):
+                clip_decay = 0.92 ** s
+                if descent_guard:
+                    I, _, _, _, _ = nftm_step_guarded(I, gt_S, M_S, controller,
+                                                      beta=beta_S, corr_clip=corr_clip_S,
+                                                      tvw=tvw, max_backtracks=3, shrink=0.5,
+                                                      clip_decay=clip_decay)
+                else:
+                    I, _ = nftm_step(I, gt_S, M_S, controller, beta=beta_S,
+                                     corr_clip=corr_clip_S, clip_decay=clip_decay)
+
+            # upsample hand-off with size-matched clamp
+            if S != sizes[-1]:
+                nextS = sizes[lvl+1]
+                I = upsample_like(I, nextS)
+                gt_next = imgs if nextS == imgs.shape[-1] else downsample_like(imgs, nextS)
+                M_next  = M if nextS == imgs.shape[-1] else downsample_mask_minpool(M, nextS)
+                I = clamp_known(I, gt_next, M_next)
 
         preds = I.clamp(-1.0, 1.0)
-        miss_mask = 1.0 - mask_known
+        miss_mask = 1.0 - M
 
         totals["psnr_all"] += float(_metric_psnr(preds, imgs).item())
         totals["psnr_miss"] += float(masked_psnr_metric(preds, imgs, miss_mask).item())
@@ -472,7 +602,7 @@ def evaluate_metrics_full(
     if batches == 0:
         raise RuntimeError("Evaluation loader produced no batches for metric computation.")
 
-    results = {key: totals[key] / batches for key in totals}
+    results = {k: totals[k] / batches for k in totals}
     # Compute final FID/KID scores over full test set
     results["fid"] = fid_compute(fid_metric)
     results["kid"] = kid_compute(kid_metric)
@@ -527,6 +657,8 @@ def main():
 
     parser.add_argument("--save_metrics", action="store_true", help="save metrics.json + psnr_curve.npy to save_dir")
     parser.add_argument("--use_wandb", action="store_true", help="enable logging to Weights & Biases (wandb)")
+    parser.add_argument("--pyramid", type=str, default="", help="comma-separated sizes for coarse->fine (e.g., '16,32' or '16,32,64'). Empty = single-scale.")
+    parser.add_argument("--pyr_steps", type=str, default="", help="comma-separated rollout steps per level summing to K_eval (e.g., '3,9'). Empty = auto split.")
     parser.add_argument("--viz_scale", type=float, default=1.0, help="Visualization upsample scale for PNG/GIF (1.0 = native, 2.0 = 2×).")
 
 
@@ -541,6 +673,10 @@ def main():
     train_dataset_name = args.train_dataset.lower()
     img_size = args.img_size
     benchmark = args.benchmark.lower()
+
+    # Parse pyramid config once
+    pyr_sizes = parse_pyramid_arg(args.pyramid, img_size)
+    pyr_steps_eval = split_steps_eval(args.K_eval, pyr_sizes, args.pyr_steps if args.pyr_steps else None)
     
     # Set training dataset
     if train_dataset_name == "cifar":
@@ -618,11 +754,12 @@ def main():
 
         train_loss, train_psnr, stats = train_epoch(
             controller, opt, train_loader, device, epoch=ep,
-            K_target=args.K_train, K_base=4, beta=beta, tvw=args.tv_weight,
+            K_target=args.K_train, K_base=4, beta=beta, beta_max=args.beta_max, tvw=args.tv_weight,
             p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
             noise_std=args.noise_std, corr_clip=args.corr_clip,
             guard_in_train=args.guard_in_train,
-            contract_w=args.contract_w, rollout_bias=True
+            contract_w=args.contract_w, rollout_bias=True,
+            pyramid_sizes=pyr_sizes
         )
 
         curves = eval_steps(
@@ -632,6 +769,7 @@ def main():
             noise_std=args.noise_std, corr_clip=args.corr_clip,
             descent_guard=False, tvw=0.0,
             save_per_epoch_dir=steps_dir, epoch_tag=ep,
+            pyramid_sizes=pyr_sizes, steps_split=pyr_steps_eval,
             viz_scale=max(1.0, float(args.viz_scale))
         )
 
@@ -691,6 +829,7 @@ def main():
         descent_guard=False, tvw=0.0,
         save_per_epoch_dir=os.path.join(args.save_dir, "final"),
         epoch_tag="final",
+        pyramid_sizes=pyr_sizes, steps_split=pyr_steps_eval,
         viz_scale=max(1.0, float(args.viz_scale))
     )
     print("[done] checkpoints and plots saved under:", args.save_dir, f"| controller={args.controller}")
@@ -709,7 +848,9 @@ def main():
             corr_clip=args.corr_clip,
             descent_guard=False,
             tvw=0.0,
-            benchmark=benchmark
+            benchmark=benchmark,
+            pyramid_sizes=pyr_sizes,
+            steps_split=pyr_steps_eval,
         )
         if psnr_curve is not None and psnr_curve.size > 0:
             np.save(os.path.join(args.save_dir, "psnr_curve.npy"), psnr_curve)
