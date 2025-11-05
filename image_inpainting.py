@@ -119,6 +119,22 @@ def ensure_dir(path: str):
     if path:
         os.makedirs(path, exist_ok=True)
 
+def upsample_for_viz(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """
+    x: (C,H,W) or (B,C,H,W)
+    Returns x if scale == 1.0, else bilinear-upsampled for readability.
+    """
+    if scale is None or scale <= 0:
+        scale = 1.0
+    if abs(scale - 1.0) < 1e-6:
+        return x
+    if x.dim() == 3:
+        x = x.unsqueeze(0)
+        out = F.interpolate(x, scale_factor=scale, mode='bilinear', align_corners=False)
+        return out.squeeze(0)
+    else:
+        return F.interpolate(x, scale_factor=scale, mode='bilinear', align_corners=False)
+
 # -------------------------- Model --------------------------
 
 class TinyController(nn.Module):
@@ -264,7 +280,7 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
 def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
                p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
                corr_clip=0.2, descent_guard=False, tvw=0.0,
-               save_per_epoch_dir=None, epoch_tag=None):
+               save_per_epoch_dir=None, epoch_tag=None, viz_scale: float = 1.0):
     controller.eval()
     psnrs_step, ssims_step, lpips_step = [], [], []
     # optional per-epoch visualization of first batch progression
@@ -288,13 +304,8 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
             plt.figure(figsize=(3*cols, 3*vis_rows))
 
             def show_img(ax, x_tensor):
-                upsampled = F.interpolate(
-                    x_tensor.unsqueeze(0),
-                    scale_factor=2,
-                    mode='bilinear',
-                    align_corners=False,
-                ).squeeze(0)
-                ax.imshow(((upsampled.permute(1, 2, 0).cpu().numpy()+1)/2).clip(0,1))
+                vis = upsample_for_viz(x_tensor, viz_scale)
+                ax.imshow(((vis.permute(1, 2, 0).cpu().numpy()+1)/2).clip(0,1))
                 ax.axis('off')
 
             gif_cols = min(8, imgs.size(0))
@@ -306,8 +317,8 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
                     return None
                 current = batch[:gif_cols].detach().clamp(-1.0, 1.0)
                 gt = gif_gt.clamp(-1.0, 1.0)
-                up_gt = F.interpolate(gt, scale_factor=2, mode='bilinear', align_corners=False)
-                up_cur = F.interpolate(current, scale_factor=2, mode='bilinear', align_corners=False)
+                up_gt = upsample_for_viz(gt, viz_scale)
+                up_cur = upsample_for_viz(current, viz_scale)
                 panel = torch.cat([up_gt, up_cur], dim=0)
                 panel = ((panel + 1.0) * 0.5).clamp(0.0, 1.0)
                 grid = tv.utils.make_grid(panel, nrow=gif_cols, padding=2, pad_value=0.0)
@@ -516,6 +527,7 @@ def main():
 
     parser.add_argument("--save_metrics", action="store_true", help="save metrics.json + psnr_curve.npy to save_dir")
     parser.add_argument("--use_wandb", action="store_true", help="enable logging to Weights & Biases (wandb)")
+    parser.add_argument("--viz_scale", type=float, default=1.0, help="Visualization upsample scale for PNG/GIF (1.0 = native, 2.0 = 2×).")
 
 
     args = parser.parse_args()
@@ -619,7 +631,8 @@ def main():
             p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
             noise_std=args.noise_std, corr_clip=args.corr_clip,
             descent_guard=False, tvw=0.0,
-            save_per_epoch_dir=steps_dir, epoch_tag=ep
+            save_per_epoch_dir=steps_dir, epoch_tag=ep,
+            viz_scale=max(1.0, float(args.viz_scale))
         )
 
         psnr_curve = curves["psnr"]
@@ -677,7 +690,8 @@ def main():
         noise_std=args.noise_std, corr_clip=args.corr_clip,
         descent_guard=False, tvw=0.0,
         save_per_epoch_dir=os.path.join(args.save_dir, "final"),
-        epoch_tag="final"
+        epoch_tag="final",
+        viz_scale=max(1.0, float(args.viz_scale))
     )
     print("[done] checkpoints and plots saved under:", args.save_dir, f"| controller={args.controller}")
 
