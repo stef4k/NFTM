@@ -71,6 +71,7 @@ def _pretty_print(summary: Dict[str, Dict[str, float]], methods: Iterable[str]) 
         "ssim_miss",
         "lpips_all",
         "lpips_miss",
+        "fid",
         "kid",
         "params",
     ]
@@ -122,7 +123,6 @@ def _run_nftm_commands(
     epochs: int,
     k_train: int,
     k_eval: int,
-    loss: str,
     device: str,
     seed: int,
     extra_args: List[str],
@@ -143,8 +143,6 @@ def _run_nftm_commands(
             str(k_train),
             "--K_eval",
             str(k_eval),
-            "--loss",
-            loss,
             "--seed",
             str(seed),
             "--device",
@@ -164,7 +162,6 @@ def _run_nftm_commands(
 def _collect_nftm_metrics(
     runs: List[Tuple[str, str]],
     *,
-    loss: str,
     epochs: int,
     k_train: int,
     k_eval: int,
@@ -177,7 +174,6 @@ def _collect_nftm_metrics(
         metrics = _load_metrics(metrics_path)
         row: Dict[str, Any] = {
             "controller": controller,
-            "loss": metrics.get("loss_mode", loss),
             "epochs": metrics.get("epochs", epochs),
             "K_train": metrics.get("K_train", k_train),
             "K_eval": metrics.get("K_eval", k_eval),
@@ -193,6 +189,8 @@ def _collect_nftm_metrics(
             "ssim_miss",
             "lpips_all",
             "lpips_miss",
+            "fid",
+            "kid",
             "runtime_ms_per_image",
         ]:
             row[key] = metrics.get(key)
@@ -205,7 +203,6 @@ def _write_nftm_summary_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         return
     columns = [
         "controller",
-        "loss",
         "epochs",
         "K_train",
         "K_eval",
@@ -217,6 +214,8 @@ def _write_nftm_summary_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         "ssim_miss",
         "lpips_all",
         "lpips_miss",
+        "fid",
+        "kid",
         "runtime_ms_per_image",
         "final_psnr",
         "save_dir",
@@ -241,6 +240,8 @@ def _print_nftm_table(rows: List[Dict[str, Any]]) -> None:
         "ssim_miss",
         "lpips_all",
         "lpips_miss",
+        "fid",
+        "kid",
         "final_psnr",
     ]
     widths = [len(col) for col in columns]
@@ -482,7 +483,6 @@ def main(argv: List[str] | None = None) -> None:
                 epochs=nftm_epochs,
                 k_train=nftm_k_train,
                 k_eval=nftm_k_eval,
-                loss=args.loss,
                 device=resolved_device,
                 seed=args.seed,
                 extra_args=list(args.extra),
@@ -524,7 +524,6 @@ def main(argv: List[str] | None = None) -> None:
         try:
             nftm_rows = _collect_nftm_metrics(
                 nftm_runs,
-                loss=args.loss,
                 epochs=nftm_epochs,
                 k_train=nftm_k_train,
                 k_eval=nftm_k_eval,

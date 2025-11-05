@@ -10,6 +10,8 @@
 import os, random, argparse, json, numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data import random_split
+from torchvision.datasets import ImageFolder
 import torchvision as tv
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
@@ -24,6 +26,7 @@ from metrics import ssim as _metric_ssim
 from metrics import (fid_init, fid_update, fid_compute,
                      kid_init, kid_update, kid_compute)
 from unet_model import TinyUNet
+import wandb
 
 # -------------------------- Utilities --------------------------
 
@@ -32,9 +35,18 @@ def set_seed(seed: int):
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
-def make_transforms():
-    # Normalize to [-1,1]
-    return T.Compose([T.ToTensor(), T.Normalize(mean=[0.5]*3, std=[0.5]*3)])
+
+def get_transform(benchmark, img_size=32):
+    if benchmark == "cifar":
+        # Normalize to [-1,1] - no resizing needed
+        return T.Compose([T.ToTensor(), T.Normalize(mean=[0.5]*3, std=[0.5]*3)])
+    else:
+        # Resize other datasets to img_size x img_size
+        return T.Compose([
+            T.Resize((img_size, img_size)),
+            T.ToTensor(), 
+            T.Normalize(mean=[0.5]*3, std=[0.5]*3)
+        ])
 
 def random_mask(batch, p_missing=(0.25, 0.5), block_prob=0.5, min_blocks=1, max_blocks=3):
     """Return mask M (1=known, 0=missing). Mix of random pixels and random square blocks."""
@@ -384,6 +396,7 @@ def evaluate_metrics_full(
     corr_clip=0.2,
     descent_guard: bool = False,
     tvw: float = 0.0,
+    benchmark
 ):
     controller.eval()
     totals = {
@@ -396,7 +409,7 @@ def evaluate_metrics_full(
     }
     batches = 0
     fid_metric = fid_init(device)
-    kid_metric = kid_init(device)
+    kid_metric = kid_init(device, benchmark=benchmark)
 
     for imgs, _ in loader:
         imgs = imgs.to(device, non_blocking=True)
@@ -497,19 +510,53 @@ def main():
     parser.add_argument("--contract_w", type=float, default=1e-3, help="contractive penalty weight")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--benchmark", type=str, default="cifar", choices=["cifar", "set12", "cbsd68", "celebahq"],help="choose test dataset for benchmarking")
+    parser.add_argument("--train_dataset", type=str, default="cifar", choices=["cifar", "celebahq"], help="Dataset for training")
+    parser.add_argument("--img_size", type=int, default=32, choices=[32, 64], help="Input image size (resize if necessary)")
 
     parser.add_argument("--save_metrics", action="store_true", help="save metrics.json + psnr_curve.npy to save_dir")
+    parser.add_argument("--use_wandb", action="store_true", help="enable logging to Weights & Biases (wandb)")
+
 
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = torch.device(args.device)
+    log_with_wandb = args.use_wandb
     print(f"[device] {device} | criterion=MSE")
 
     # Data
-    transform = make_transforms()
-    train_set = tv.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
-    test_set  = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+    train_dataset_name = args.train_dataset.lower()
+    img_size = args.img_size
+    benchmark = args.benchmark.lower()
+    
+    # Set training dataset
+    if train_dataset_name == "cifar":
+        transform_train = get_transform("cifar", img_size=img_size)
+        train_set = tv.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform_train)
+    elif train_dataset_name == "celebahq":
+        transform_train = get_transform("celebahq", img_size=img_size)
+        train_set = ImageFolder(root="./benchmarks/CelebAHQ/", transform=transform_train)
+    else:
+        raise ValueError(f"Unknown train dataset: {args.train_dataset}")
+    
+    transform_test = get_transform(benchmark, img_size=img_size)
+    # Set test dataset
+    if benchmark == "cifar":
+        test_set = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
+    elif benchmark == "set12":
+        test_set = ImageFolder(root="./benchmarks/Set12", transform=transform_test)
+    elif benchmark == "cbsd68":
+        test_set = ImageFolder(root="./benchmarks/CBSD68", transform=transform_test)
+    elif (benchmark == "celebahq") and train_dataset_name == "celebahq":
+        # Random split 80-20 for train and test set
+        train_size = int(0.8 * len(train_set))
+        test_size = len(train_set) - train_size
+        train_set, test_set = random_split(train_set, [train_size, test_size], generator=torch.Generator().manual_seed(42))
+    elif benchmark == "celebahq":
+        test_set = ImageFolder(root="./benchmarks/CelebAHQ", transform=transform_test)
+    else:
+        raise ValueError(f"Unknown benchmark dataset: {args.benchmark}")
 
     use_cuda_pinning = (device.type == "cuda")
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2,
@@ -594,6 +641,19 @@ def main():
         print(msg)
         if args.guard_in_train:
             print(f"         accepted steps: {stats['accepted']} | backtracks (approx): {stats['backtracks']}")
+        # Log metrics to Weights & Biases
+        if log_with_wandb:
+            wandb.log({
+                "epoch": ep,
+                "train/loss": train_loss,
+                "train/psnr": train_psnr,
+                "eval/psnr_final": float(psnr_curve[-1]) if psnr_curve.size > 0 else None,
+                "eval/ssim_final": float(ssim_curve[-1]) if ssim_curve.size > 0 else None,
+                "eval/lpips_final": float(lpips_curve[-1]) if lpips_curve.size > 0 else None,
+                "beta": beta,
+                "K_train": stats["train_K"],
+                "controller": args.controller,
+            })
 
     # Save final metric curves
     if psnr_curve is not None and psnr_curve.size > 0:
@@ -635,6 +695,7 @@ def main():
             corr_clip=args.corr_clip,
             descent_guard=False,
             tvw=0.0,
+            benchmark=benchmark
         )
         if psnr_curve is not None and psnr_curve.size > 0:
             np.save(os.path.join(args.save_dir, "psnr_curve.npy"), psnr_curve)
@@ -674,6 +735,17 @@ def main():
         with open(os.path.join(args.save_dir, "metrics.json"), "w") as f:
             json.dump(summary, f, indent=2)
         print(f"[metrics] saved metrics.json & psnr_curve.npy in {args.save_dir} | controller={args.controller}")
+    if log_with_wandb:
+    # Finish logging
+        wandb.log({
+            "final/psnr": summary.get("final_psnr"),
+            "final/ssim": summary.get("final_ssim"),
+            "final/lpips": summary.get("final_lpips"),
+            "final/fid": summary.get("fid"),
+            "final/kid": summary.get("kid"),
+            "params": param_total,
+        })
+        wandb.finish()
 
 if __name__ == "__main__":
     main()

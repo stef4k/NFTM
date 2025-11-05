@@ -5,3 +5,10 @@ pillow>=10.0
 imageio>=2.31
 torch>=2.1
 torchvision>=0.16
+lpips>=0.1.4
+torchmetrics>=1.3
+tqdm>=4.66
+pandas>=2.1
+wandb>=0.22.2
+ipykernel
+notebook

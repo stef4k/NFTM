@@ -34,10 +34,10 @@ def run_one(config, script="image_inpainting.py"):
     cmd.append("--save_metrics")
 
     # loss selection
-    loss_mode = config.get("loss", "hetero")
-    cmd += ["--loss", loss_mode]
-    if loss_mode == "homo":
-        cmd += ["--homo_sigma", str(config.get("homo_sigma", 0.1))]
+    # loss_mode = config.get("loss", "hetero")
+    # cmd += ["--loss", loss_mode]
+    # if loss_mode == "homo":
+    #     cmd += ["--homo_sigma", str(config.get("homo_sigma", 0.1))]
 
     # toggles
     cmd += ["--save_dir", save_dir]
@@ -91,7 +91,7 @@ def plot_curves(all_metrics, out_png):
 
 def save_csv(all_metrics, out_csv):
     ensure_dir(os.path.dirname(out_csv) or ".")
-    keys = ["name","loss_mode","homo_sigma","epochs","K_train","K_eval",
+    keys = ["name","epochs","K_train","K_eval",
             "beta_start","beta_max","beta_anneal","beta_eval_bonus",
             "corr_clip","tv_weight","final_psnr","duration_sec"]
     with open(out_csv, "w", newline="") as f:
@@ -132,12 +132,10 @@ def main():
 
     # -------- Experiments (override AFTER unpacking base) --------
     experiments = [
-        {**base, "name":"hetero_baseline", "loss":"hetero"},
-        {**base, "name":"hetero_Keval20", "loss":"hetero", "K_eval":20},
-        {**base, "name":"hetero_clip0p08", "loss":"hetero", "corr_clip":0.08},
-        {**base, "name":"hetero_slow_beta", "loss":"hetero", "beta_start":0.20, "beta_anneal":0.02},
-        {**base, "name":"homo_sigma0p10", "loss":"homo", "homo_sigma":0.10},
-        {**base, "name":"homo_sigma0p10_Keval20", "loss":"homo", "homo_sigma":0.10, "K_eval":20},
+        {**base, "name":"baseline"},
+        {**base, "name":"Keval20", "K_eval":20},
+        {**base, "name":"clip0p08", "corr_clip":0.08},
+        {**base, "name":"slow_beta", "beta_start":0.20, "beta_anneal":0.02},
     ]
 
     # place each run in its own folder
@@ -158,7 +156,7 @@ def main():
         print("\n== Summary (final PSNR) ==")
         for m in sorted(results, key=lambda x: x["final_psnr"], reverse=True):
             print(f"{m['name']:<28} final PSNR: {m['final_psnr']:.2f} dB  "
-                  f"[loss={m['loss_mode']}, Keval={m['K_eval']}]")
+                  f"[Keval={m['K_eval']}]")
     else:
         print("No successful runs to summarize.")
 
