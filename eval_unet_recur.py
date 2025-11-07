@@ -14,7 +14,7 @@ from torchvision.utils import save_image
 
 from image_inpainting import (
     corrupt_images,
-    make_transforms,
+    get_transform,
     random_mask,
     set_seed,
 )
@@ -93,7 +93,7 @@ def build_model(checkpoint: Dict, device: torch.device) -> RecUNet:
 
 def get_dataloader(batch_size: int, num_workers: int, device: torch.device) -> DataLoader:
     """Create the CIFAR-10 test dataloader with the standard transforms."""
-    transform = make_transforms()
+    transform = get_transform()
     try:
         dataset = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
     except Exception as exc:  # pragma: no cover - offline fallback
@@ -169,8 +169,13 @@ def save_samples(
     save_image(visual_tensor.cpu(), save_path, nrow=4)
 
 
-def evaluate(model: RecUNet, loader: DataLoader, device: torch.device, save_dir: str) -> Dict[str, float]:
-    """Run evaluation across ``loader`` and return aggregated metrics."""
+def evaluate(
+    model: RecUNet,
+    loader: DataLoader,
+    device: torch.device,
+    save_dir: str,
+    rec_steps: int = 3,
+) -> Dict[str, float]:
     metric_names = [
         "psnr_all",
         "psnr_miss",
@@ -185,14 +190,26 @@ def evaluate(model: RecUNet, loader: DataLoader, device: torch.device, save_dir:
 
     model.eval()
     with torch.no_grad():
-        for batch_idx, (imgs, _) in enumerate(loader):
+        for imgs, _ in loader:
             imgs = imgs.to(device, non_blocking=True)
-            mask_known = random_mask(imgs, p_missing=(0.25, 0.5), block_prob=0.5, min_blocks=1, max_blocks=3)
-            mask_known = mask_known.to(device)
-            inputs = corrupt_images(imgs, mask_known, noise_std=0.3)
-            network_input = torch.cat([inputs, mask_known], dim=1)
 
-            preds = model(network_input).clamp(-1.0, 1.0)
+            mask_known = random_mask(
+                imgs,
+                p_missing=(0.25, 0.5),
+                block_prob=0.5,
+                min_blocks=1,
+                max_blocks=3
+            ).to(device)
+
+            inputs = corrupt_images(imgs, mask_known, noise_std=0.3)
+            img = inputs
+
+            for _ in range(rec_steps):
+                network_input = torch.cat([img, mask_known], dim=1)
+                pred = model(network_input).clamp(-1.0, 1.0)
+                img = mask_known * img + (1.0 - mask_known) * pred
+
+            preds = img
             miss_mask = 1.0 - mask_known
 
             totals["psnr_all"] += psnr(preds, imgs).item()
@@ -206,9 +223,6 @@ def evaluate(model: RecUNet, loader: DataLoader, device: torch.device, save_dir:
             if not sample_saved:
                 save_samples(save_dir, imgs, inputs, mask_known, preds)
                 sample_saved = True
-
-    if batch_count == 0:
-        raise RuntimeError("Evaluation loader produced no batches.")
 
     return {name: totals[name] / batch_count for name in metric_names}
 

@@ -14,7 +14,7 @@ from torchvision.utils import save_image
 
 from image_inpainting import (
     corrupt_images,
-    make_transforms,
+    get_transform,
     random_mask,
     set_seed,
 )
@@ -95,7 +95,7 @@ def build_model(checkpoint: Dict, device: torch.device) -> TinyUNet:
 
 def get_dataloader(batch_size: int, num_workers: int, device: torch.device) -> DataLoader:
     """Create the CIFAR-10 test dataloader with the standard transforms."""
-    transform = make_transforms()
+    transform = get_transform()
     try:
         dataset = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
     except Exception as exc:  # pragma: no cover - offline fallback

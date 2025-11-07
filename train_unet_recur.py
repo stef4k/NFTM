@@ -19,7 +19,7 @@ from torchvision.utils import make_grid, save_image
 
 from image_inpainting import (
     corrupt_images,
-    make_transforms,
+    get_transform,
     random_mask,
     set_seed,
     tv_l1,
@@ -67,7 +67,7 @@ def create_dataloaders(
     val_size: int,
     data_root: str,
 ) -> Tuple[DataLoader, DataLoader, torch.utils.data.Dataset]:
-    transform = make_transforms()
+    transform = get_transform()
     train_ds = load_cifar_split(data_root, True, transform)
     test_ds = load_cifar_split(data_root, False, transform)
 
@@ -152,22 +152,34 @@ def train_one_epoch(
     loader: DataLoader,
     device: torch.device,
     tv_weight: float,
+    rec_steps: int = 3,
 ) -> float:
     model.train()
     total_loss = 0.0
+
     for imgs, _ in loader:
         imgs = imgs.to(device, non_blocking=True)
-        mask = random_mask(imgs, p_missing=(0.25, 0.5), block_prob=0.5, min_blocks=1, max_blocks=3)
-        corrupted = corrupt_images(imgs, mask, noise_std=0.3)
-        print("Input shape:", imgs.shape)
-        print("Mask shape:", mask.shape)
-        print("Corrupted image shape:", corrupted.shape)
-        inp = torch.cat([corrupted, mask], dim=1)
-        print("Concatenated input shape:", inp.shape)
 
-        pred = model(inp)
-        data_loss = F.l1_loss(pred, imgs)
-        tv_loss = tv_l1(pred)
+        mask_known = random_mask(
+            imgs,
+            p_missing=(0.25, 0.5),
+            block_prob=0.5,
+            min_blocks=1,
+            max_blocks=3
+        ).to(device)
+
+        corrupted = corrupt_images(imgs, mask_known, noise_std=0.3)
+        img = corrupted
+
+        for _ in range(rec_steps):
+            inp = torch.cat([img, mask_known], dim=1)
+            pred = model(inp)
+            img = mask_known * img + (1 - mask_known) * pred
+
+        final_pred = img
+
+        data_loss = F.l1_loss(final_pred, imgs)
+        tv_loss = tv_l1(final_pred)
         loss = data_loss + tv_weight * tv_loss
 
         optimizer.zero_grad(set_to_none=True)
@@ -176,7 +188,9 @@ def train_one_epoch(
         optimizer.step()
 
         total_loss += loss.item()
+
     return total_loss / max(len(loader), 1)
+
 
 
 def evaluate_full(
@@ -185,6 +199,7 @@ def evaluate_full(
     device: torch.device,
     sample_path: Optional[str] = None,
     sample_rows: int = 6,
+    rec_steps: int = 3,
 ) -> Dict[str, float]:
     model.eval()
     total_mse_all = 0.0
@@ -201,43 +216,52 @@ def evaluate_full(
     with torch.no_grad():
         for imgs, _ in loader:
             imgs = imgs.to(device)
-            mask = random_mask(imgs, p_missing=(0.25, 0.5), block_prob=0.5, min_blocks=1, max_blocks=3)
-            corrupted = corrupt_images(imgs, mask, noise_std=0.3)
-            inp = torch.cat([corrupted, mask], dim=1)
-            pred = model(inp)
 
-            diff = pred - imgs
+            mask_known = random_mask(
+                imgs,
+                p_missing=(0.25, 0.5),
+                block_prob=0.5,
+                min_blocks=1,
+                max_blocks=3
+            ).to(device)
+
+            corrupted = corrupt_images(imgs, mask_known, noise_std=0.3)
+            img = corrupted
+
+            for _ in range(rec_steps):
+                inp = torch.cat([img, mask_known], dim=1)
+                pred = model(inp)
+                img = mask_known * img + (1 - mask_known) * pred
+
+            final_pred = img
+
+            diff = final_pred - imgs
             total_mse_all += diff.pow(2).sum().item()
             total_pixels_all += diff.numel()
 
-            miss_mask = 1.0 - mask
-            se_miss, denom_miss = masked_psnr_components(pred, imgs, miss_mask)
+            miss_mask = 1.0 - mask_known
+            se_miss, denom_miss = masked_psnr_components(final_pred, imgs, miss_mask)
             total_mse_miss += se_miss
             total_pixels_miss += denom_miss
 
             mask_b = miss_mask.expand_as(imgs)
-            ssim_all = ssim(pred, imgs).item()
-            ssim_miss = ssim(pred * mask_b, imgs * mask_b).item()
-            lpips_all = lpips_dist(pred, imgs).item()
-            lpips_miss = lpips_dist(pred * mask_b, imgs * mask_b).item()
+            total_ssim_all += ssim(final_pred, imgs).item() * imgs.size(0)
+            total_ssim_miss += ssim(final_pred * mask_b, imgs * mask_b).item() * imgs.size(0)
+            total_lpips_all += lpips_dist(final_pred, imgs).item() * imgs.size(0)
+            total_lpips_miss += lpips_dist(final_pred * mask_b, imgs * mask_b).item() * imgs.size(0)
 
-            bsz = imgs.size(0)
-            total_ssim_all += ssim_all * bsz
-            total_ssim_miss += ssim_miss * bsz
-            total_lpips_all += lpips_all * bsz
-            total_lpips_miss += lpips_miss * bsz
-            total_images += bsz
+            total_images += imgs.size(0)
 
             if sample_path and not sample_captured:
                 sample_captured = True
-                save_prediction_grid(imgs, corrupted, mask, pred, sample_path, sample_rows)
+                save_prediction_grid(imgs, corrupted, mask_known, final_pred, sample_path, sample_rows)
 
     mse_all = total_mse_all / max(total_pixels_all, 1e-8)
     mse_miss = total_mse_miss / max(total_pixels_miss, 1e-8)
     psnr_all = 10.0 * math.log10(4.0 / max(mse_all, 1e-12)) if mse_all > 0 else 99.0
     psnr_miss = 10.0 * math.log10(4.0 / max(mse_miss, 1e-12)) if mse_miss > 0 else 99.0
 
-    metrics = {
+    return {
         "psnr_all": psnr_all,
         "psnr_miss": psnr_miss,
         "ssim_all": total_ssim_all / max(total_images, 1),
@@ -245,7 +269,7 @@ def evaluate_full(
         "lpips_all": total_lpips_all / max(total_images, 1),
         "lpips_miss": total_lpips_miss / max(total_images, 1),
     }
-    return metrics
+
 
 
 def save_prediction_grid(

@@ -118,26 +118,21 @@ class RecUNet(nn.Module):
         Returns:
             Tensor of shape ``(B, out_ch, H, W)`` with values in ``[-1, 1]``.
         """
-        rec_steps = self.rec_steps
-        out = x
-        ### TO DO -- the 
-        for _ in range(rec_steps-1):
-            skip1 = self.enc1(out)
-            print("skip1 shape:", skip1.shape)
-            down1 = self.down1(skip1)
-            print("down1 shape:", down1.shape)
-            skip2 = self.enc2(down1)
-            print("skip2 shape:", skip2.shape)
-            down2 = self.down2(skip2)
-            print("down2 shape:", down2.shape)
-            bottleneck = self.bottleneck(down2)
-
-            up1 = self.up1(bottleneck, skip2)
-            print("up1 shape:", up1.shape)
-            up2 = self.up2(up1, skip1)
-            print("up2 shape:", up2.shape)
-            out = self.out_rec_conv(up2)
-            print("output", out.shape)
+        skip1 = self.enc1(x)
+        ##print("skip1 shape:", skip1.shape)
+        down1 = self.down1(skip1)
+        
+        skip2 = self.enc2(down1)
+        
+        down2 = self.down2(skip2)
+        
+        bottleneck = self.bottleneck(down2)
+        up1 = self.up1(bottleneck, skip2)
+    
+        up2 = self.up2(up1, skip1)
+    
+        out = self.out_rec_conv(up2)
+        return out
         # skip1 = self.enc1(out)
         # print("skip1 shape:", skip1.shape)
         # down1 = self.down1(skip1)
@@ -155,7 +150,7 @@ class RecUNet(nn.Module):
         # print("output", out.shape)
         # out = self.activation(out)
         # print("output2", out.shape)
-        return out
+        
 
 
 def _smoke_test() -> None:

@@ -19,7 +19,7 @@ from torchvision.utils import make_grid, save_image
 
 from image_inpainting import (
     corrupt_images,
-    make_transforms,
+    get_transform,
     random_mask,
     set_seed,
     tv_l1,
@@ -67,7 +67,7 @@ def create_dataloaders(
     val_size: int,
     data_root: str,
 ) -> Tuple[DataLoader, DataLoader, torch.utils.data.Dataset]:
-    transform = make_transforms()
+    transform = get_transform()
     train_ds = load_cifar_split(data_root, True, transform)
     test_ds = load_cifar_split(data_root, False, transform)
 

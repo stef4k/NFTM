@@ -19,7 +19,7 @@ try:  # Prefer shared helpers if available
     from image_inpainting import (
         clamp_known,
         corrupt_images,
-        make_transforms,
+        get_transform,
         random_mask,
         set_seed,
     )
@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover - fallback copies (should not trigger in
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
 
-    def make_transforms():
+    def get_transform():
         return T.Compose([T.ToTensor(), T.Normalize(mean=[0.5] * 3, std=[0.5] * 3)])
 
     def random_mask(batch, p_missing=(0.25, 0.5), block_prob=0.5, min_blocks=1, max_blocks=3):
@@ -244,7 +244,7 @@ def masked_metric_mean(
 
 def run_eval(params: TVL1Params, args: argparse.Namespace) -> Dict[str, float]:
     device = torch.device(args.device)
-    transform = make_transforms()
+    transform = get_transform()
     try:
         dataset = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
     except Exception as exc:  # pragma: no cover - offline fallback

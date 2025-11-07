@@ -36,7 +36,7 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = True
 
 
-def get_transform(benchmark, img_size=32):
+def get_transform(benchmark="cifar", img_size=32):
     if benchmark == "cifar":
         # Normalize to [-1,1] - no resizing needed
         return T.Compose([T.ToTensor(), T.Normalize(mean=[0.5]*3, std=[0.5]*3)])
