@@ -18,10 +18,10 @@ from image_inpainting import (
     random_mask,
     set_seed,
 )
-from metrics import lpips_dist, param_count, psnr, ssim
-from metrics import (fid_init, fid_update, fid_compute,
+from nftm_inpaint.metrics import lpips_dist, param_count, psnr, ssim
+from nftm_inpaint.metrics import (fid_init, fid_update, fid_compute,
                      kid_init, kid_update, kid_compute)
-from unet_model import TinyUNet
+from nftm_inpaint.unet_model import TinyUNet
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:

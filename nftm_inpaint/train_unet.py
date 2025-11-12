@@ -24,8 +24,8 @@ from image_inpainting import (
     set_seed,
     tv_l1,
 )
-from metrics import lpips_dist, param_count, ssim
-from unet_model import TinyUNet
+from nftm_inpaint.metrics import lpips_dist, param_count, ssim
+from nftm_inpaint.unet_model import TinyUNet
 
 
 @dataclass
