@@ -88,8 +88,8 @@ NFTM/
 ├─ docs/
 │  └─ pyramid_trick.md                 # Notes on the multi-scale (pyramid) rollout
 gpu_jobs/
-├─ gpu_job.slurm                       # Single-run job: train/eval image_inpainting.py on GPU
-└─ inpainting_grid_sweep.slurm         # Large grid-search sweep using inpainting_grid_search_sweep.py
+|  ├─ gpu_job.slurm                       # Single-run job: train/eval image_inpainting.py on GPU
+|  └─ inpainting_grid_sweep.slurm         # Large grid-search sweep using inpainting_grid_search_sweep.py
 ```
 
 Quick start (single-scale, CIFAR-10 @ 32×32):
