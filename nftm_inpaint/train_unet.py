@@ -15,14 +15,24 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 import torchvision as tv
+from torchvision.datasets import ImageFolder
+from torch.utils.data import random_split
 from torchvision.utils import make_grid, save_image
+import sys, os
 
-from image_inpainting import (
+root_dir = os.path.dirname(os.path.abspath(__file__))  # directory containing this file
+parent_dir = os.path.abspath(os.path.join(root_dir, ".."))  # parent directory
+benchmarks_dir = os.path.join(parent_dir, "benchmarks")
+
+from rollout import (
     corrupt_images,
-    make_transforms,
+    tv_l1,
+)
+
+from data_and_viz import(
+    get_transform,
     random_mask,
     set_seed,
-    tv_l1,
 )
 from nftm_inpaint.metrics import lpips_dist, param_count, ssim
 from nftm_inpaint.unet_model import TinyUNet
@@ -52,6 +62,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_batches", type=int, default=8, help="Number of validation batches per epoch")
     parser.add_argument("--val_size", type=int, default=2000, help="Number of validation images")
     parser.add_argument("--data_root", type=str, default="data", help="Path to the CIFAR-10 dataset root")
+    parser.add_argument("--benchmark", type=str, default="cifar", help="Dataset key for choosing transforms")
+    parser.add_argument("--img_size", type=int, default=32, choices=[32, 64], help="Input image size (resize if necessary)")
+    parser.add_argument("--train_dataset", type=str, default="cifar", choices=["cifar", "celebahq"], help="Dataset for training")
+
     return parser.parse_args()
 
 
@@ -66,13 +80,42 @@ def create_dataloaders(
     num_workers: int,
     val_size: int,
     data_root: str,
+    train_dataset: str,
+    benchmark: str,
+    img_size: int,
 ) -> Tuple[DataLoader, DataLoader, torch.utils.data.Dataset]:
-    transform = make_transforms()
-    train_ds = load_cifar_split(data_root, True, transform)
-    test_ds = load_cifar_split(data_root, False, transform)
+    transform = get_transform(benchmark, img_size=img_size)
+
+    # Set training dataset
+    if train_dataset == "cifar":
+        transform_train = get_transform("cifar", img_size=img_size)
+        train_set = tv.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform_train)
+    elif train_dataset == "celebahq":
+        transform_train = get_transform("celebahq", img_size=img_size)
+        train_set = ImageFolder(root=os.path.join(benchmarks_dir, "CelebAHQ"), transform=transform_train)
+    else:
+        raise ValueError(f"Unknown train dataset: {train_dataset}")
+    
+    transform_test = get_transform(benchmark, img_size=img_size)
+    # Set test dataset
+    if benchmark == "cifar":
+        test_set = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
+    elif benchmark == "set12":
+        test_set = ImageFolder(root="./benchmarks/Set12", transform=transform_test)
+    elif benchmark == "cbsd68":
+        test_set = ImageFolder(root="./benchmarks/CBSD68", transform=transform_test)
+    elif (benchmark == "celebahq") and train_dataset == "celebahq":
+        # Random split 80-20 for train and test set
+        train_size = int(0.8 * len(train_set))
+        test_size = len(train_set) - train_size
+        train_set, test_set = random_split(train_set, [train_size, test_size], generator=torch.Generator().manual_seed(42))
+    elif benchmark == "celebahq":
+        test_set = ImageFolder(root=os.path.join(benchmarks_dir, "CelebAHQ"), transform=transform_test)
+    else:
+        raise ValueError(f"Unknown benchmark dataset: {benchmark}")
 
     train_loader = DataLoader(
-        train_ds,
+        train_set,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
@@ -81,8 +124,8 @@ def create_dataloaders(
     )
 
     if val_size > 0:
-        val_indices = list(range(min(val_size, len(test_ds))))
-        val_subset = Subset(test_ds, val_indices)
+        val_indices = list(range(min(val_size, len(test_set))))
+        val_subset = Subset(test_set, val_indices)
         val_loader = DataLoader(
             val_subset,
             batch_size=batch_size,
@@ -91,9 +134,9 @@ def create_dataloaders(
             pin_memory=True,
         )
     else:
-        val_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+        val_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    return train_loader, val_loader, test_ds
+    return train_loader, val_loader, test_set
 
 
 def load_cifar_split(root: str, train: bool, transform) -> torch.utils.data.Dataset:
@@ -293,6 +336,9 @@ def main() -> None:
         num_workers=args.num_workers,
         val_size=args.val_size,
         data_root=args.data_root,
+        train_dataset = args.train_dataset,
+        benchmark=args.benchmark,
+        img_size=args.img_size,
     )
 
     model = TinyUNet(in_ch=4, out_ch=3, base=args.base).to(device)

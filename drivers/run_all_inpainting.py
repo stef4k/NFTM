@@ -12,6 +12,16 @@ import subprocess
 import time
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Tuple
+import sys
+os.environ["PYTHONPATH"] = (
+    os.path.dirname(os.path.abspath(__file__)) + ":" +
+    os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+)
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+INPAINT_DIR = os.path.join(PROJECT_ROOT, "nftm_inpaint")
+INPAINT_DIR = os.path.abspath(INPAINT_DIR)
 
 
 def _ensure_dir(path: str) -> None:
@@ -127,12 +137,15 @@ def _run_nftm_commands(
     seed: int,
     extra_args: List[str],
     mask_dir: str | None,
+    train_dataset: str | None,
+    benchmark: str | None,
+    img_size: int | None,
 ) -> List[Tuple[str, str]]:
     runs: List[Tuple[str, str]] = []
     for controller, save_dir in controller_dirs.items():
         cmd = [
             py_executable,
-            "image_inpainting.py",
+            os.path.join(PROJECT_ROOT, "image_inpainting.py"),
             "--controller",
             controller,
             "--save_dir",
@@ -149,10 +162,22 @@ def _run_nftm_commands(
             device,
             "--save_metrics",
         ]
+
         if mask_dir and "--mask_dir" not in extra_args:
             cmd.extend(["--mask_dir", mask_dir])
+
+        if train_dataset:
+            cmd.extend(["--train_dataset", train_dataset])
+
+        if benchmark:
+            cmd.extend(["--benchmark", benchmark])
+
+        if img_size:
+            cmd.extend(["--img_size", str(img_size)])
+
         if extra_args:
             cmd.extend(extra_args)
+
         stage_name = f"nftm_{controller}"
         _run_stage(stage_name, cmd)
         runs.append((controller, save_dir))
@@ -289,6 +314,11 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--K_train", type=int, default=None)
     parser.add_argument("--K_eval", type=int, default=None)
     parser.add_argument("--extra", nargs=argparse.REMAINDER, default=[])
+
+    parser.add_argument("--train_dataset", type=str, default="cifar", choices=["cifar", "celebahq"], help="Dataset for training")
+    parser.add_argument("--benchmark", type=str, default="cifar", choices=["cifar", "set12", "cbsd68", "celebahq"],help="choose test dataset for benchmarking")
+    parser.add_argument("--img_size", type=int, default=32, choices=[32, 64], help="Input image size (resize if necessary)")
+
     args = parser.parse_args(argv)
 
     baseline_epochs = args.epochs if args.epochs is not None else 20
@@ -323,7 +353,7 @@ def main(argv: List[str] | None = None) -> None:
             "train_unet",
             [
                 py_executable,
-                "train_unet.py",
+                os.path.join(INPAINT_DIR, "train_unet.py"),
                 "--epochs",
                 str(baseline_epochs),
                 "--batch_size",
@@ -346,6 +376,11 @@ def main(argv: List[str] | None = None) -> None:
                 str(args.num_workers),
                 "--device",
                 resolved_device,
+                "--benchmark",
+                str(args.benchmark),
+                "--img_size",
+                str(args.img_size),
+
             ],
         )
 
@@ -353,7 +388,7 @@ def main(argv: List[str] | None = None) -> None:
             "eval_unet",
             [
                 py_executable,
-                "eval_unet.py",
+                os.path.join(INPAINT_DIR, "eval_unet.py"),
                 "--ckpt",
                 os.path.join(dirs["unet"], "ckpt.pt"),
                 "--batch_size",
@@ -403,10 +438,18 @@ def main(argv: List[str] | None = None) -> None:
                 "nftm",
                 [
                     py_executable,
-                    "image_inpainting.py",
+                    os.path.join(PROJECT_ROOT, "image_inpainting.py"),
                     "--save_metrics",
                     "--save_dir",
                     dirs["nftm"],
+                    "--train_dataset",
+                    str(args.train_dataset),
+                    "--benchmark",
+                    str(args.benchmark),
+                    "--img_size",
+                    str(args.img_size),
+                    "--epochs",
+                    str(20),
                 ],
             )
         if args.include_nftm:
@@ -422,8 +465,11 @@ def main(argv: List[str] | None = None) -> None:
                 seed=args.seed,
                 extra_args=list(args.extra),
                 mask_dir=mask_dir_value,
+                train_dataset=args.train_dataset,
+                benchmark=args.benchmark,
+                img_size=args.img_size,
             )
-    except subprocess.CalledProcessError as exc:  # pragma: no cover - runtime failure path
+    except subprocess.CalledProcessError as exc:
         cmd = " ".join(str(part) for part in exc.cmd)
         print(f"[error] command failed with exit code {exc.returncode}: {cmd}")
         raise SystemExit(exc.returncode)
@@ -472,5 +518,5 @@ def main(argv: List[str] | None = None) -> None:
         _print_nftm_table(nftm_rows)
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI entry point
+if __name__ == "__main__":
     main()

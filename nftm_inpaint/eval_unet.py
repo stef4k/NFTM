@@ -11,17 +11,19 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 import torchvision as tv
 from torchvision.utils import save_image
+from torchvision.datasets import ImageFolder
+from torch.utils.data import random_split
 
-from image_inpainting import (
-    corrupt_images,
-    make_transforms,
-    random_mask,
-    set_seed,
-)
+from rollout import (corrupt_images)
+from data_and_viz import (random_mask, set_seed, get_transform)
 from nftm_inpaint.metrics import lpips_dist, param_count, psnr, ssim
 from nftm_inpaint.metrics import (fid_init, fid_update, fid_compute,
                      kid_init, kid_update, kid_compute)
 from nftm_inpaint.unet_model import TinyUNet
+
+root_dir = os.path.dirname(os.path.abspath(__file__))  # directory containing this file
+parent_dir = os.path.abspath(os.path.join(root_dir, ".."))  # parent directory
+benchmarks_dir = os.path.join(parent_dir, "benchmarks")
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -44,6 +46,10 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="out_unet_eval",
         help="Directory to store metrics.json and qualitative samples.",
     )
+    parser.add_argument("--benchmark", type=str, default="cifar", help="Dataset key for choosing transforms")
+    parser.add_argument("--img_size", type=int, default=32, choices=[32, 64], help="Input image size (resize if necessary)")
+    parser.add_argument("--train_dataset", type=str, default="cifar", choices=["cifar", "celebahq"], help="Dataset for training")
+
     return parser.parse_args(argv)
 
 
@@ -93,24 +99,28 @@ def build_model(checkpoint: Dict, device: torch.device) -> TinyUNet:
     return model
 
 
-def get_dataloader(batch_size: int, num_workers: int, device: torch.device) -> DataLoader:
-    """Create the CIFAR-10 test dataloader with the standard transforms."""
-    transform = make_transforms()
-    try:
-        dataset = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
-    except Exception as exc:  # pragma: no cover - offline fallback
-        print(f"Dataset download failed ({exc}); retrying without download flag.")
-        try:
-            dataset = tv.datasets.CIFAR10(root="./data", train=False, download=False, transform=transform)
-        except Exception as inner:  # pragma: no cover - offline fallback
-            raise RuntimeError(
-                "CIFAR-10 dataset unavailable. Please place the extracted dataset under ./data/cifar-10-batches-py."
-            ) from inner
+def get_dataloader(args: argparse.Namespace, device: torch.device) -> DataLoader:
+    """Load the corresponding benchmark dataset"""
+    transform_test = get_transform(args.benchmark, img_size=args.img_size)
+    # Set test dataset
+    if args.benchmark == "cifar":
+        dataset = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
+    elif args.benchmark == "set12":
+        dataset = ImageFolder(root=os.path.join(benchmarks_dir, "Set12"), transform=transform_test)
+    elif args.benchmark == "cbsd68":
+        dataset = ImageFolder(root=os.path.join(benchmarks_dir,"CBSD68"), transform=transform_test)
+    elif args.benchmark == "celebahq":
+        train_set = ImageFolder(root=os.path.join(benchmarks_dir, "CelebAHQ"), transform=transform_test)
+        train_size = int(0.8 * len(train_set))
+        test_size = len(train_set) - train_size
+        _, dataset = random_split(train_set, [train_size, test_size], generator=torch.Generator().manual_seed(42))
+    else:
+        raise ValueError(f"Unknown benchmark dataset: {args.benchmark}")
     return DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )
 
@@ -233,7 +243,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     model = build_model(checkpoint, device)
     params = param_count(model)
 
-    loader = get_dataloader(args.batch_size, args.num_workers, device)
+    loader = get_dataloader(args, device)
     os.makedirs(args.save_dir, exist_ok=True)
 
     metrics = evaluate(model, loader, device, args.save_dir)

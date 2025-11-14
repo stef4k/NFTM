@@ -10,19 +10,23 @@ from typing import Callable, Dict, Iterable, Optional
 
 import torch
 import torch.nn.functional as F
+from torchvision.datasets import ImageFolder
+from torch.utils.data import random_split
 import torchvision as tv
 from torchvision.utils import save_image
-from metrics import (fid_init, fid_update, fid_compute,
+from nftm_inpaint.metrics import (fid_init, fid_update, fid_compute,
                      kid_init, kid_update, kid_compute)
 
+root_dir = os.path.dirname(os.path.abspath(__file__))  # directory containing this file
+grandparent_dir = os.path.abspath(os.path.join(root_dir, "..", ".."))  # parent of parent
+benchmarks_dir = os.path.join(grandparent_dir, "benchmarks")
+
 try:  # Prefer shared helpers if available
-    from image_inpainting import (
+    from nftm_inpaint.rollout import (
         clamp_known,
-        corrupt_images,
-        make_transforms,
-        random_mask,
-        set_seed,
+        corrupt_images 
     )
+    from nftm_inpaint.data_and_viz import set_seed, get_transform, random_mask
 except ImportError:  # pragma: no cover - fallback copies (should not trigger in repo)
     import random
 
@@ -35,9 +39,6 @@ except ImportError:  # pragma: no cover - fallback copies (should not trigger in
         random.seed(seed)
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
-
-    def make_transforms():
-        return T.Compose([T.ToTensor(), T.Normalize(mean=[0.5] * 3, std=[0.5] * 3)])
 
     def random_mask(batch, p_missing=(0.25, 0.5), block_prob=0.5, min_blocks=1, max_blocks=3):
         B, C, H, W = batch.shape
@@ -244,17 +245,21 @@ def masked_metric_mean(
 
 def run_eval(params: TVL1Params, args: argparse.Namespace) -> Dict[str, float]:
     device = torch.device(args.device)
-    transform = make_transforms()
-    try:
-        dataset = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
-    except Exception as exc:  # pragma: no cover - offline fallback
-        print(f"Dataset download failed ({exc}); retrying without download flag.")
-        try:
-            dataset = tv.datasets.CIFAR10(root="./data", train=False, download=False, transform=transform)
-        except Exception as inner:
-            raise RuntimeError(
-                "CIFAR-10 dataset unavailable. Please place the extracted dataset under ./data/cifar-10-batches-py."
-            ) from inner
+    transform_test = get_transform(args.benchmark, img_size=args.img_size)
+    # Set test dataset
+    if args.benchmark == "cifar":
+        dataset = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
+    elif args.benchmark == "set12":
+        dataset = ImageFolder(root=os.path.join(benchmarks_dir, "Set12"), transform=transform_test)
+    elif args.benchmark == "cbsd68":
+        dataset = ImageFolder(root=os.path.join(benchmarks_dir,"CBSD68"), transform=transform_test)
+    elif args.benchmark == "celebahq":
+        train_set = ImageFolder(root=os.path.join(benchmarks_dir, "CelebAHQ"), transform=transform_test)
+        train_size = int(0.8 * len(train_set))
+        test_size = len(train_set) - train_size
+        _, dataset = random_split(train_set, [train_size, test_size], generator=torch.Generator().manual_seed(42))
+    else:
+        raise ValueError(f"Unknown benchmark dataset: {args.benchmark}")
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -355,6 +360,10 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--save_dir", type=str, default="out_tvl1")
     parser.add_argument("--no_cuda", action="store_true", help="Deprecated flag (ignored)")
+    parser.add_argument("--benchmark", type=str, default="cifar", help="Dataset key for choosing transforms")
+    parser.add_argument("--img_size", type=int, default=32, choices=[32, 64], help="Input image size (resize if necessary)")
+    parser.add_argument("--train_dataset", type=str, default="cifar", choices=["cifar", "celebahq"], help="Dataset for training")
+
     return parser.parse_args(argv)
 
 
@@ -378,7 +387,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     )
 
     print(
-        f"Running TV-L1 baseline on CIFAR-10 test set with {params.iters} iterations "
+        f"Running TV-L1 baseline on {args.benchmark} test set with {params.iters} iterations "
         f"(device={args.device})"
     )
     metrics = run_eval(params, args)

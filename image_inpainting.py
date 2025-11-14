@@ -34,6 +34,10 @@ from nftm_inpaint.rollout import parse_pyramid_arg, split_steps_eval, count_para
 from nftm_inpaint.controller import TinyController, UNetController
 from nftm_inpaint.engine import train_epoch, eval_steps, evaluate_metrics_full
 
+root_dir = os.path.dirname(os.path.abspath(__file__))   # directory containing the script
+benchmarks_dir = os.path.join(root_dir, "benchmarks")
+
+
 # -------------------------- Main --------------------------
 
 def main():
@@ -97,7 +101,7 @@ def main():
         train_set = tv.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform_train)
     elif train_dataset_name == "celebahq":
         transform_train = get_transform("celebahq", img_size=img_size)
-        train_set = ImageFolder(root="./benchmarks/CelebAHQ/", transform=transform_train)
+        train_set = ImageFolder(root=os.path.join(benchmarks_dir, "CelebAHQ"), transform=transform_train)
     else:
         raise ValueError(f"Unknown train dataset: {args.train_dataset}")
     
@@ -115,7 +119,7 @@ def main():
         test_size = len(train_set) - train_size
         train_set, test_set = random_split(train_set, [train_size, test_size], generator=torch.Generator().manual_seed(42))
     elif benchmark == "celebahq":
-        test_set = ImageFolder(root="./benchmarks/CelebAHQ", transform=transform_test)
+        test_set = ImageFolder(root=os.path.join(benchmarks_dir, "CelebAHQ"), transform=transform_test)
     else:
         raise ValueError(f"Unknown benchmark dataset: {args.benchmark}")
 
