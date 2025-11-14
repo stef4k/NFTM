@@ -66,7 +66,7 @@ NFTM/
 ├─ image_inpainting.py                  # Main CLI: train/eval one run (pyramid or single-scale)
 ├─ run_experiments.py                   # Batch launcher + result aggregator for multiple runs
 ├─ run-experiments-sweep.py             # Hyperparameter sweep helper (local)
-├─ inpainting_grid_search_sweep.py      # ?
+├─ inpainting_grid_search_sweep.py      # Exhaustive hyperparameter sweep visualized in weights and biases
 │
 ├─ nftm_inpaint/                        # Inpainting related modules
 │  ├─ __init__.py
