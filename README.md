@@ -59,6 +59,39 @@ python3 heat_eq.py --mode variable --timesteps 10 --eval_timesteps 20 --epochs_a
 - The output PSNR curve and visualizations will show how well the model extrapolates to longer horizons.
 
 ## Image Inpainting
+
+Repository structure:
+```
+NFTM/
+├─ image_inpainting.py                  # Main CLI: train/eval one run (pyramid or single-scale)
+├─ run_experiments.py                   # Batch launcher + result aggregator for multiple runs
+├─ run-experiments-sweep.py             # Hyperparameter sweep helper (local)
+├─ inpainting_grid_search_sweep.py      # ?
+│
+├─ nftm_inpaint/                        # Inpainting related modules
+│  ├─ __init__.py
+│  ├─ controller.py                     # TinyController & UNetController wrappers
+│  ├─ engine.py                         # Train/eval engines, descent guard, energy, metrics eval
+│  ├─ rollout.py                        # NFTM step, multi-scale pyramid rollout helpers
+│  ├─ data_and_viz.py                   # Datasets, transforms, masking, plotting/PNG/GIF
+│  ├─ metrics.py                        # PSNR/SSIM/LPIPS + FID/KID wrappers
+│  ├─ unet_model.py                     # TinyUNet backbone used by UNetController
+│  ├─ train_unet.py                     # Baseline UNet trainer (supervised)
+│  └─ eval_unet.py                      # Baseline UNet evaluator/metrics
+│
+├─ drivers/
+│  └─ run_all_inpainting.py
+│
+├─ baselines/
+│  └─ inpainting/
+│     └─ tvl1_baseline.py              # TV-L1 primal-dual inpainting baseline
+├─ docs/
+│  └─ pyramid_trick.md                 # Notes on the multi-scale (pyramid) rollout
+gpu_jobs/
+├─ gpu_job.slurm                       # Single-run job: train/eval image_inpainting.py on GPU
+└─ inpainting_grid_sweep.slurm         # Large grid-search sweep using inpainting_grid_search_sweep.py
+```
+
 Quick start (single-scale, CIFAR-10 @ 32×32):
 ```bash
 python3 image_inpainting.py \
