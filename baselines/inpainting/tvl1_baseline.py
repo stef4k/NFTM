@@ -260,6 +260,9 @@ def run_eval(params: TVL1Params, args: argparse.Namespace) -> Dict[str, float]:
         _, dataset = random_split(train_set, [train_size, test_size], generator=torch.Generator().manual_seed(42))
     else:
         raise ValueError(f"Unknown benchmark dataset: {args.benchmark}")
+    
+    print(f"[TVL1 Eval Data] benchmark={args.benchmark}, img_size={args.img_size}")
+    print(f"[TVL1 Eval Data] dataset size={len(dataset)}")
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -362,7 +365,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no_cuda", action="store_true", help="Deprecated flag (ignored)")
     parser.add_argument("--benchmark", type=str, default="cifar", help="Dataset key for choosing transforms")
     parser.add_argument("--img_size", type=int, default=32, choices=[32, 64], help="Input image size (resize if necessary)")
-    parser.add_argument("--train_dataset", type=str, default="cifar", choices=["cifar", "celebahq"], help="Dataset for training")
 
     return parser.parse_args(argv)
 

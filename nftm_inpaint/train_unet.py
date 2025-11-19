@@ -84,7 +84,6 @@ def create_dataloaders(
     benchmark: str,
     img_size: int,
 ) -> Tuple[DataLoader, DataLoader, torch.utils.data.Dataset]:
-    transform = get_transform(benchmark, img_size=img_size)
 
     # Set training dataset
     if train_dataset == "cifar":
@@ -114,6 +113,8 @@ def create_dataloaders(
     else:
         raise ValueError(f"Unknown benchmark dataset: {benchmark}")
 
+    print(f"[Data] train_dataset={train_dataset}, benchmark={benchmark}, img_size={img_size}")
+    print(f"[Data] train_set size={len(train_set)}")
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,

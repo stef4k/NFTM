@@ -113,9 +113,14 @@ def get_dataloader(args: argparse.Namespace, device: torch.device) -> DataLoader
         train_set = ImageFolder(root=os.path.join(benchmarks_dir, "CelebAHQ"), transform=transform_test)
         train_size = int(0.8 * len(train_set))
         test_size = len(train_set) - train_size
+        # Only use the test set - since it is the eval_unet script
         _, dataset = random_split(train_set, [train_size, test_size], generator=torch.Generator().manual_seed(42))
     else:
         raise ValueError(f"Unknown benchmark dataset: {args.benchmark}")
+    
+    # Print message to be sure the right benchmark and image size is used
+    print(f"[Eval Data] benchmark={args.benchmark}, img_size={args.img_size}")
+    print(f"[Eval Data] dataset size={len(dataset)}")
     return DataLoader(
         dataset,
         batch_size=args.batch_size,

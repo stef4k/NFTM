@@ -151,7 +151,7 @@ def _run_nftm_commands(
             "--save_dir",
             save_dir,
             "--epochs",
-            str(epochs),
+            str(2),#str(epochs),
             "--K_train",
             str(k_train),
             "--K_eval",
@@ -355,7 +355,7 @@ def main(argv: List[str] | None = None) -> None:
                 py_executable,
                 os.path.join(INPAINT_DIR, "train_unet.py"),
                 "--epochs",
-                str(baseline_epochs),
+                str(2),#str(baseline_epochs),
                 "--batch_size",
                 str(args.batch_size),
                 "--lr",
@@ -380,6 +380,8 @@ def main(argv: List[str] | None = None) -> None:
                 str(args.benchmark),
                 "--img_size",
                 str(args.img_size),
+                "--train_dataset",
+                str(args.train_dataset)
 
             ],
         )
@@ -401,6 +403,10 @@ def main(argv: List[str] | None = None) -> None:
                 dirs["unet_eval"],
                 "--device",
                 resolved_device,
+                "--benchmark",
+                str(args.benchmark),
+                "--img_size",
+                str(args.img_size)
             ],
         )
 
@@ -430,6 +436,10 @@ def main(argv: List[str] | None = None) -> None:
                 dirs["tvl1"],
                 "--device",
                 resolved_device,
+                "--benchmark",
+                str(args.benchmark),
+                "--img_size",
+                str(args.img_size)
             ],
         )
 
@@ -449,7 +459,7 @@ def main(argv: List[str] | None = None) -> None:
                     "--img_size",
                     str(args.img_size),
                     "--epochs",
-                    str(20),
+                    str(2),#str(20),
                 ],
             )
         if args.include_nftm:

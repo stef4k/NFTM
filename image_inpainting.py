@@ -122,6 +122,8 @@ def main():
         test_set = ImageFolder(root=os.path.join(benchmarks_dir, "CelebAHQ"), transform=transform_test)
     else:
         raise ValueError(f"Unknown benchmark dataset: {args.benchmark}")
+    print(f"[Data] train_dataset={train_dataset_name}, benchmark={benchmark}, img_size={img_size}")
+    print(f"[Data] train_set size={len(train_set)}, test_set size={len(test_set)}")
 
     use_cuda_pinning = (device.type == "cuda")
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2,
