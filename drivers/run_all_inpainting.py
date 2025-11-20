@@ -151,7 +151,7 @@ def _run_nftm_commands(
             "--save_dir",
             save_dir,
             "--epochs",
-            str(2),#str(epochs),
+            str(epochs),
             "--K_train",
             str(k_train),
             "--K_eval",
@@ -340,6 +340,7 @@ def main(argv: List[str] | None = None) -> None:
         "unet": os.path.join(base_dir, "unet"),
         "unet_eval": os.path.join(base_dir, "unet_eval"),
         "tvl1": os.path.join(base_dir, "tvl1"),
+        "nftm_dense_pyramid": os.path.join(base_dir, "nftm_dense_pyramid"),
     }
     if args.include_nftm:
         dirs["nftm"] = os.path.join(base_dir, "nftm")
@@ -355,7 +356,7 @@ def main(argv: List[str] | None = None) -> None:
                 py_executable,
                 os.path.join(INPAINT_DIR, "train_unet.py"),
                 "--epochs",
-                str(2),#str(baseline_epochs),
+                str(baseline_epochs),
                 "--batch_size",
                 str(args.batch_size),
                 "--lr",
@@ -442,6 +443,30 @@ def main(argv: List[str] | None = None) -> None:
                 str(args.img_size)
             ],
         )
+        
+        _run_stage(
+            "nftm_pyramid",
+            [
+                py_executable,
+                os.path.join(PROJECT_ROOT, "image_inpainting.py"),
+                "--controller", "dense",
+                "--save_dir", dirs["nftm_dense_pyramid"],
+                "--epochs", str(30),
+                "--K_train", str(20),
+                "--K_eval", str(30),
+
+                "--seed", str(args.seed),
+                "--device", resolved_device,
+                "--save_metrics",
+
+                "--train_dataset", str(args.train_dataset),
+                "--benchmark", str(args.benchmark),
+                "--img_size", str(args.img_size),
+
+                "--pyramid", "16,32,64",
+                "--pyr_steps", "3,10,17",
+            ],
+        )
 
         if args.include_nftm and "nftm" in dirs:
             _run_stage(
@@ -459,7 +484,8 @@ def main(argv: List[str] | None = None) -> None:
                     "--img_size",
                     str(args.img_size),
                     "--epochs",
-                    str(2),#str(20),
+                    str(20),
+                    "--device", resolved_device
                 ],
             )
         if args.include_nftm:
