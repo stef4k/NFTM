@@ -318,8 +318,21 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--train_dataset", type=str, default="cifar", choices=["cifar", "celebahq"], help="Dataset for training")
     parser.add_argument("--benchmark", type=str, default="cifar", choices=["cifar", "set12", "cbsd68", "celebahq"],help="choose test dataset for benchmarking")
     parser.add_argument("--img_size", type=int, default=32, choices=[32, 64], help="Input image size (resize if necessary)")
+    parser.add_argument("--quick", action="store_true", help="Run a very fast debug version")
+
 
     args = parser.parse_args(argv)
+    if args.quick:
+        print("[quick] Running in FAST DEBUG MODE")
+        # tiny epochs
+        args.epochs = 1
+        # small batch
+        args.batch_size = 16
+        # faster rollout
+        args.K_train = 2
+        args.K_eval = 4
+        # tv-l1 extremely reduced
+        args.tvl1_iters = 10
 
     baseline_epochs = args.epochs if args.epochs is not None else 20
     nftm_epochs = args.epochs if args.epochs is not None else 30
@@ -344,12 +357,46 @@ def main(argv: List[str] | None = None) -> None:
     }
     if args.include_nftm:
         dirs["nftm"] = os.path.join(base_dir, "nftm")
+    
+    # Pyramid settings based on image size
+    if args.img_size == 32:
+        pyramid_value = "16,32"
+        pyr_steps_value = "3,27"
+    elif args.img_size == 64:
+        pyramid_value = "16,32,64"
+        pyr_steps_value = "3,10,17"
+    else:
+        raise ValueError(f"Unsupported img_size={args.img_size}: expected 32 or 64")
 
     for path in [base_dir, *dirs.values()]:
         _ensure_dir(path)
 
     nftm_runs: List[Tuple[str, str]] = []
     try:
+    
+        _run_stage(
+            "nftm_pyramid",
+            [
+                py_executable,
+                os.path.join(PROJECT_ROOT, "image_inpainting.py"),
+                "--controller", "dense",
+                "--save_dir", dirs["nftm_dense_pyramid"],
+                "--epochs", str(30),
+                "--K_train", str(20),
+                "--K_eval", str(30),
+
+                "--seed", str(args.seed),
+                "--device", resolved_device,
+                "--save_metrics",
+
+                "--train_dataset", str(args.train_dataset),
+                "--benchmark", str(args.benchmark),
+                "--img_size", str(args.img_size),
+
+                "--pyramid", pyramid_value,
+                "--pyr_steps", pyr_steps_value
+            ],
+        )
         _run_stage(
             "train_unet",
             [
@@ -444,29 +491,6 @@ def main(argv: List[str] | None = None) -> None:
             ],
         )
         
-        _run_stage(
-            "nftm_pyramid",
-            [
-                py_executable,
-                os.path.join(PROJECT_ROOT, "image_inpainting.py"),
-                "--controller", "dense",
-                "--save_dir", dirs["nftm_dense_pyramid"],
-                "--epochs", str(30),
-                "--K_train", str(20),
-                "--K_eval", str(30),
-
-                "--seed", str(args.seed),
-                "--device", resolved_device,
-                "--save_metrics",
-
-                "--train_dataset", str(args.train_dataset),
-                "--benchmark", str(args.benchmark),
-                "--img_size", str(args.img_size),
-
-                "--pyramid", "16,32,64",
-                "--pyr_steps", "3,10,17",
-            ],
-        )
 
         if args.include_nftm and "nftm" in dirs:
             _run_stage(
