@@ -9,7 +9,7 @@ print(f"[setup] Using cached Torch models from: {os.environ['TORCH_HOME']}")
 
 fixed_config = {
     "controller": "dense",
-    "img_size": 32,
+    "img_size": 64,
     "benchmark": "celebahq",
     "train_dataset": "celebahq"
 }
@@ -26,7 +26,7 @@ for epochs, k_train, k_eval in itertools.product(
     config = {**fixed_config, "epochs": epochs, "K_train": k_train, "K_eval": k_eval}
     run_name = (
         f"_ep{epochs}_ktr{str(k_train)}_kev{str(k_eval)}"
-        f"{config['controller']}_img{config['img_size']}"
+        f"{config['train_dataset']}_img{config['img_size']}"
         
     )
     save_dir = os.path.join("out", run_name)
