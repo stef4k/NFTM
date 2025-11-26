@@ -9,7 +9,6 @@
 #SBATCH --gpus-per-task=1         # exactly 1 GPU per task
 #SBATCH --mem=64G
 #SBATCH --partition=gpu
-#SBATCH --qos=normal
 
 # ---- Environment setup ----
 source ~/.bashrc
@@ -25,9 +24,11 @@ export WANDB__SERVICE_WAIT=300
 export WANDB_CONSOLE=wrap
 export NCCL_P2P_DISABLE=1
 
-# Create the Bayesian sweep once and launch one agent per GPU
-SWEEP_ID=$(python inpainting_grid_search_sweep.py --create-only --project image_inpainting_sweep)
-echo "[sweep] id=${SWEEP_ID}"
+
+echo "=== Creating sweep ==="
+SWEEP_ID=$(python inpainting_grid_search_sweep.py --create-only --project image_inpainting_sweep | tail -n 1)
+
+echo "Sweep ID inside SLURM: '${SWEEP_ID}'"
 
 RUNS_PER_AGENT=${RUNS_PER_AGENT:-4}
 GPUS=${SLURM_GPUS_ON_NODE:-1}
