@@ -4,9 +4,9 @@
 #SBATCH --error=logs/inpainting_grid_sweep_%j.err
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:2
-#SBATCH --mem=16G
-#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --mem=64G
+#SBATCH --partition=gpua100
 #SBATCH --qos=normal
 
 # ---- Environment setup ----
