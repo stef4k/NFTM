@@ -29,8 +29,7 @@ from nftm_inpaint.data_and_viz import random_mask  # data helper
 
 def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 beta=0.4, beta_max=0.6, tvw=0.01, p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
-                corr_clip=0.2, guard_in_train=True, contract_w=1e-3, rollout_bias=True, pyramid_sizes=None,
-                step_loss_mode: str = "final"):
+                corr_clip=0.2, guard_in_train=True, contract_w=1e-3, rollout_bias=True, pyramid_sizes=None):
     controller.train()
     psnrs, losses = [], []
     accepted_steps, backtracks = 0, 0
@@ -60,20 +59,6 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
         I = clamp_known(I0.clone(), imgs, M)
         I_prev_for_contract = I.clone().detach()
 
-        # step-weighted loss
-        use_linear_steps = (step_loss_mode == "linear")
-        if use_linear_steps:
-            # weights α_k ∝ k, normalized so sum(α_k) = 1
-            # k = 1..K_curr (total number of NFTM steps in this rollout)
-            step_weights = torch.arange(
-                1, K_curr + 1,
-                device=device,
-                dtype=imgs.dtype
-            )
-            step_weights = step_weights / step_weights.sum()
-            step_idx = 0
-            data_loss_accum = 0.0  # tensor via first addition
-
         for lvl, (S, T) in enumerate(zip(sizes, steps_per)):
             gt_S = imgs if S == imgs.shape[-1] else downsample_like(imgs, S)
             M_S = M if S == imgs.shape[-1] else downsample_mask_minpool(M, S)
@@ -98,14 +83,6 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                         I, gt_S, M_S, controller,
                         beta=beta_S, corr_clip=corr_clip_S, clip_decay=clip_decay
                     )
-                # ----- NEW: accumulate per-step MSE with linear weights -----
-                if use_linear_steps:
-                    step_idx += 1  # global step index across levels
-                    w_k = step_weights[step_idx - 1]       # scalar tensor
-                    # compare at current scale S against downsampled GT
-                    step_mse = F.mse_loss(I, gt_S)
-                    data_loss_accum = data_loss_accum + w_k * step_mse
-                # -----------------------------------------------------------
 
             if S != sizes[-1]:
                 nextS = sizes[lvl+1]
@@ -113,14 +90,6 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 gt_next = imgs if nextS == imgs.shape[-1] else downsample_like(imgs, nextS)
                 M_next  = M if nextS == M.shape[-1] else downsample_mask_minpool(M, nextS)
                 I = clamp_known(I, gt_next, M_next)
-
-        # ----------------- data loss: choose mode -----------------
-        if use_linear_steps:
-            data_loss = data_loss_accum
-        else:
-            # original behavior: only final fine output
-            data_loss = F.mse_loss(I, imgs)
-        # ----------------------------------------------------------
 
         # Loss on final fine output
         data_loss = F.mse_loss(I, imgs)
@@ -144,17 +113,33 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
     return float(np.mean(losses)), float(np.mean(psnrs)), stats
 
 @torch.no_grad()
-def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
-               p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
-               corr_clip=0.2, descent_guard=False, tvw=0.0,
-               save_per_epoch_dir=None, epoch_tag=None, pyramid_sizes=None, 
-               steps_split=None, viz_scale: float = 1.0):
+def eval_steps(
+    controller,
+    loader,
+    device,
+    K_eval=10,
+    beta=0.6,
+    p_missing=(0.25, 0.5),
+    block_prob=0.5,
+    noise_std=0.3,
+    corr_clip=0.2,
+    descent_guard=False,
+    tvw=0.0,
+    save_per_epoch_dir=None,
+    epoch_tag=None,
+    pyramid_sizes=None,
+    steps_split=None,
+    viz_scale: float = 1.0,
+    fo_dump_dir: str = None,
+    fo_max_samples: int = 8,
+):
     controller.eval()
     psnrs_step, ssims_step, lpips_step = [], [], []
     # optional per-epoch visualization of first batch progression
     save_seq = (save_per_epoch_dir is not None)
     if save_seq:
         ensure_dir(save_per_epoch_dir)
+    fo_records = []
 
     for bidx, (imgs, _) in enumerate(loader):
         imgs = imgs.to(device, non_blocking=True)
@@ -206,6 +191,35 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
                 init_frame = make_gif_frame(I.clamp(-1.0, 1.0))
                 if init_frame is not None:
                     gif_frames.append(init_frame)
+
+        fo_enabled = save_seq and bidx == 0 and fo_dump_dir is not None
+        fo_sample_cap = 0
+        if fo_enabled:
+            ensure_dir(fo_dump_dir)
+            fo_sample_cap = min(int(fo_max_samples), imgs.size(0))
+            for i in range(fo_sample_cap):
+                sample_dir = os.path.join(fo_dump_dir, f"sample_{i:03d}")
+                ensure_dir(sample_dir)
+                tv.utils.save_image(
+                    imgs[i].clamp(-1.0, 1.0),
+                    os.path.join(sample_dir, "gt.png"),
+                    normalize=True,
+                    value_range=(-1, 1),
+                )
+                tv.utils.save_image(
+                    I0[i].clamp(-1.0, 1.0),
+                    os.path.join(sample_dir, "masked.png"),
+                    normalize=True,
+                    value_range=(-1, 1),
+                )
+                fo_records.append(
+                    {
+                        "sample_dir": sample_dir,
+                        "gt": os.path.join(sample_dir, "gt.png"),
+                        "masked": os.path.join(sample_dir, "masked.png"),
+                        "steps": [],
+                    }
+                )
 
         # BEFORE (conceptually):
         # for s in range(K_eval): step at native resolution
@@ -259,6 +273,19 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
                     frame = make_gif_frame(I_metrics)
                     if frame is not None:
                         gif_frames.append(frame)
+                if fo_enabled and fo_sample_cap > 0:
+                    I_for_save = I_metrics.clamp(-1.0, 1.0)
+                    for i in range(fo_sample_cap):
+                        out_path = os.path.join(
+                            fo_records[i]["sample_dir"], f"step_{total_steps:02d}.png"
+                        )
+                        tv.utils.save_image(
+                            I_for_save[i],
+                            out_path,
+                            normalize=True,
+                            value_range=(-1, 1),
+                        )
+                        fo_records[i]["steps"].append(out_path)
 
             if S != sizes[-1]:
                 nextS = sizes[lvl+1]
@@ -291,6 +318,8 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
         "ssim": np.array(ssims_step).mean(axis=0) if ssims_step else np.array([]),
         "lpips": np.array(lpips_step).mean(axis=0) if lpips_step else np.array([]),
     }
+    if fo_dump_dir is not None and fo_records:
+        curves["fo_records"] = fo_records
     return curves
 
 

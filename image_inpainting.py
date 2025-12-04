@@ -77,7 +77,11 @@ def main():
     parser.add_argument("--pyramid", type=str, default="", help="comma-separated sizes for coarse->fine (e.g., '16,32' or '16,32,64'). Empty = single-scale.")
     parser.add_argument("--pyr_steps", type=str, default="", help="comma-separated rollout steps per level summing to K_eval (e.g., '3,9'). Empty = auto split.")
     parser.add_argument("--viz_scale", type=float, default=1.0, help="Visualization upsample scale for PNG/GIF (1.0 = native, 2.0 = 2×).")
-    parser.add_argument("--step_loss", type=str, default="final", choices=["final", "linear"], help="How to accumulate data loss over rollout steps: ""'final' = only final output, 'linear' = linearly weighted per-step losses.")
+    parser.add_argument("--fo_log", action="store_true", help="push first eval batch to FiftyOne for interactive viewing")
+    parser.add_argument("--fo_dataset", type=str, default="nftm-inpaint", help="FiftyOne dataset name (overwritten if exists)")
+    parser.add_argument("--fo_port", type=int, default=5151, help="FiftyOne App port for remote access")
+    parser.add_argument("--fo_address", type=str, default="0.0.0.0", help="FiftyOne App bind address (use 0.0.0.0 when port-forwarding)")
+    parser.add_argument("--fo_max_samples", type=int, default=8, help="number of samples from the first eval batch to log to FiftyOne")
 
 
     args = parser.parse_args()
@@ -163,10 +167,6 @@ def main():
     steps_dir = os.path.join(args.save_dir, "steps") if args.save_epoch_progress else None
     if steps_dir: ensure_dir(steps_dir)
 
-    log_path = os.path.join(args.save_dir, "train_log.txt")
-    log_f = open(log_path, "a", buffering=1, encoding="utf-8")  # line-buffered
-    print(f"[logging] writing epoch logs to {log_path}", flush=True)
-
     psnr_curve = None
     ssim_curve = None
     lpips_curve = None
@@ -183,8 +183,7 @@ def main():
             noise_std=args.noise_std, corr_clip=args.corr_clip,
             guard_in_train=args.guard_in_train,
             contract_w=args.contract_w, rollout_bias=True,
-            pyramid_sizes=pyr_sizes,
-            step_loss_mode=args.step_loss
+            pyramid_sizes=pyr_sizes
         )
 
         curves = eval_steps(
@@ -215,13 +214,8 @@ def main():
         if ssim_curve.size > 0 and lpips_curve.size > 0:
             msg += (f" | final SSIM {ssim_curve[-1]:.4f} | final LPIPS {lpips_curve[-1]:.4f}")
         print(msg)
-        log_f.write(msg + "\n") # save to file
-
         if args.guard_in_train:
-            extra = (f"         accepted steps: {stats['accepted']} | backtracks (approx): {stats['backtracks']}")
-            print(extra)
-            log_f.write(extra + "\n")
-
+            print(f"         accepted steps: {stats['accepted']} | backtracks (approx): {stats['backtracks']}")
         # Log metrics to Weights & Biases
         if log_with_wandb:
             wandb.log({
@@ -251,7 +245,8 @@ def main():
     final_beta = min(args.beta_start + args.beta_anneal * (args.epochs-1), args.beta_max)
     beta_eval_final = min(final_beta + args.beta_eval_bonus, 0.9)
 
-    _ = eval_steps(
+    fo_dump_dir = os.path.join(args.save_dir, "fo_dump") if args.fo_log else None
+    final_curves = eval_steps(
         controller, test_loader, device,
         K_eval=args.K_eval, beta=beta_eval_final,
         p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
@@ -260,9 +255,34 @@ def main():
         save_per_epoch_dir=os.path.join(args.save_dir, "final"),
         epoch_tag="final",
         pyramid_sizes=pyr_sizes, steps_split=pyr_steps_eval,
-        viz_scale=max(1.0, float(args.viz_scale))
+        viz_scale=max(1.0, float(args.viz_scale)),
+        fo_dump_dir=fo_dump_dir,
+        fo_max_samples=args.fo_max_samples,
     )
     print("[done] checkpoints and plots saved under:", args.save_dir, f"| controller={args.controller}")
+
+    if args.fo_log:
+        fo_records = final_curves.get("fo_records", [])
+        if fo_records:
+            import fiftyone as fo
+            ds = fo.Dataset(args.fo_dataset, overwrite=True)
+            for rec in fo_records:
+                group = fo.Group()
+                ds.add_sample(fo.Sample(filepath=rec["gt"], group=group.element("gt")))
+                ds.add_sample(fo.Sample(filepath=rec["masked"], group=group.element("masked")))
+                for i, step_path in enumerate(rec["steps"], 1):
+                    ds.add_sample(
+                        fo.Sample(filepath=step_path, group=group.element(f"step_{i:02d}"))
+                    )
+            session = fo.launch_app(ds, address=args.fo_address, port=args.fo_port, remote=True)
+            print(f"[fiftyone] launched FiftyOne App at {session.url}")
+            # Block so the App stays alive until the user closes it or cancels the job.
+            try:
+                session.wait()
+            except KeyboardInterrupt:
+                pass
+        else:
+            print("[fiftyone] no eval samples were logged; check eval loader or fo_max_samples.")
 
     # Save metrics for the driver / comparisons
     if args.save_metrics:
@@ -331,8 +351,6 @@ def main():
             "params": param_total,
         })
         wandb.finish()
-    
-    log_f.close()
 
 if __name__ == "__main__":
     main()
