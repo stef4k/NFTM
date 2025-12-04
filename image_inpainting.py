@@ -26,7 +26,7 @@ from nftm_inpaint.metrics import ssim as _metric_ssim
 from nftm_inpaint.metrics import (fid_init, fid_update, fid_compute,
                      kid_init, kid_update, kid_compute)
 from nftm_inpaint.unet_model import TinyUNet
-import wandb
+# import wandb
 
 # bring in our split pieces
 from nftm_inpaint.data_and_viz import set_seed, get_transform, ensure_dir, plot_metric_curve
@@ -77,6 +77,7 @@ def main():
     parser.add_argument("--pyramid", type=str, default="", help="comma-separated sizes for coarse->fine (e.g., '16,32' or '16,32,64'). Empty = single-scale.")
     parser.add_argument("--pyr_steps", type=str, default="", help="comma-separated rollout steps per level summing to K_eval (e.g., '3,9'). Empty = auto split.")
     parser.add_argument("--viz_scale", type=float, default=1.0, help="Visualization upsample scale for PNG/GIF (1.0 = native, 2.0 = 2×).")
+    parser.add_argument("--step_loss", type=str, default="final", choices=["final", "linear"], help="How to accumulate data loss over rollout steps: ""'final' = only final output, 'linear' = linearly weighted per-step losses.")
 
 
     args = parser.parse_args()
@@ -178,7 +179,8 @@ def main():
             noise_std=args.noise_std, corr_clip=args.corr_clip,
             guard_in_train=args.guard_in_train,
             contract_w=args.contract_w, rollout_bias=True,
-            pyramid_sizes=pyr_sizes
+            pyramid_sizes=pyr_sizes,
+            step_loss_mode=args.step_loss
         )
 
         curves = eval_steps(

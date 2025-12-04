@@ -29,7 +29,8 @@ from nftm_inpaint.data_and_viz import random_mask  # data helper
 
 def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 beta=0.4, beta_max=0.6, tvw=0.01, p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
-                corr_clip=0.2, guard_in_train=True, contract_w=1e-3, rollout_bias=True, pyramid_sizes=None):
+                corr_clip=0.2, guard_in_train=True, contract_w=1e-3, rollout_bias=True, pyramid_sizes=None,
+                step_loss_mode: str = "final"):
     controller.train()
     psnrs, losses = [], []
     accepted_steps, backtracks = 0, 0
@@ -59,6 +60,20 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
         I = clamp_known(I0.clone(), imgs, M)
         I_prev_for_contract = I.clone().detach()
 
+        # step-weighted loss
+        use_linear_steps = (step_loss_mode == "linear")
+        if use_linear_steps:
+            # weights α_k ∝ k, normalized so sum(α_k) = 1
+            # k = 1..K_curr (total number of NFTM steps in this rollout)
+            step_weights = torch.arange(
+                1, K_curr + 1,
+                device=device,
+                dtype=imgs.dtype
+            )
+            step_weights = step_weights / step_weights.sum()
+            step_idx = 0
+            data_loss_accum = 0.0  # tensor via first addition
+
         for lvl, (S, T) in enumerate(zip(sizes, steps_per)):
             gt_S = imgs if S == imgs.shape[-1] else downsample_like(imgs, S)
             M_S = M if S == imgs.shape[-1] else downsample_mask_minpool(M, S)
@@ -83,6 +98,14 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                         I, gt_S, M_S, controller,
                         beta=beta_S, corr_clip=corr_clip_S, clip_decay=clip_decay
                     )
+                # ----- NEW: accumulate per-step MSE with linear weights -----
+                if use_linear_steps:
+                    step_idx += 1  # global step index across levels
+                    w_k = step_weights[step_idx - 1]       # scalar tensor
+                    # compare at current scale S against downsampled GT
+                    step_mse = F.mse_loss(I, gt_S)
+                    data_loss_accum = data_loss_accum + w_k * step_mse
+                # -----------------------------------------------------------
 
             if S != sizes[-1]:
                 nextS = sizes[lvl+1]
@@ -90,6 +113,14 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 gt_next = imgs if nextS == imgs.shape[-1] else downsample_like(imgs, nextS)
                 M_next  = M if nextS == M.shape[-1] else downsample_mask_minpool(M, nextS)
                 I = clamp_known(I, gt_next, M_next)
+
+        # ----------------- data loss: choose mode -----------------
+        if use_linear_steps:
+            data_loss = data_loss_accum
+        else:
+            # original behavior: only final fine output
+            data_loss = F.mse_loss(I, imgs)
+        # ----------------------------------------------------------
 
         # Loss on final fine output
         data_loss = F.mse_loss(I, imgs)
