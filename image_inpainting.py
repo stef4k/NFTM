@@ -163,6 +163,10 @@ def main():
     steps_dir = os.path.join(args.save_dir, "steps") if args.save_epoch_progress else None
     if steps_dir: ensure_dir(steps_dir)
 
+    log_path = os.path.join(args.save_dir, "train_log.txt")
+    log_f = open(log_path, "a", buffering=1, encoding="utf-8")  # line-buffered
+    print(f"[logging] writing epoch logs to {log_path}", flush=True)
+
     psnr_curve = None
     ssim_curve = None
     lpips_curve = None
@@ -211,8 +215,13 @@ def main():
         if ssim_curve.size > 0 and lpips_curve.size > 0:
             msg += (f" | final SSIM {ssim_curve[-1]:.4f} | final LPIPS {lpips_curve[-1]:.4f}")
         print(msg)
+        log_f.write(msg + "\n") # save to file
+
         if args.guard_in_train:
-            print(f"         accepted steps: {stats['accepted']} | backtracks (approx): {stats['backtracks']}")
+            extra = (f"         accepted steps: {stats['accepted']} | backtracks (approx): {stats['backtracks']}")
+            print(extra)
+            log_f.write(extra + "\n")
+
         # Log metrics to Weights & Biases
         if log_with_wandb:
             wandb.log({
@@ -322,6 +331,8 @@ def main():
             "params": param_total,
         })
         wandb.finish()
+    
+    log_f.close()
 
 if __name__ == "__main__":
     main()
