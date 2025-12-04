@@ -40,7 +40,7 @@ echo "[Dense A100] Sweep: ${SWEEP_ID}"
 python inpainting_grid_search_sweep_a100.py \
         --sweep-id "${SWEEP_ID}" \
         --controller dense \
-        --count 1000 \
+        --count 25 \
         --run-group "dense_${SLURM_JOB_ID}" \
         --name-prefix "dense" \
         --project dense_inpainting_sweep

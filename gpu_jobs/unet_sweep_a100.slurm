@@ -40,7 +40,7 @@ echo "[UNET A100] Sweep: ${SWEEP_ID}"
 python inpainting_grid_search_sweep_a100.py \
         --sweep-id "${SWEEP_ID}" \
         --controller unet \
-        --count 1000 \
+        --count 25 \
         --run-group "unet_${SLURM_JOB_ID}" \
         --name-prefix "unet" \
         --project unet_inpainting_sweep
