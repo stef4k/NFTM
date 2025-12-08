@@ -150,6 +150,12 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
                save_per_epoch_dir=None, epoch_tag=None, pyramid_sizes=None, 
                steps_split=None, viz_scale: float = 1.0):
     controller.eval()
+
+    # same masks + noise every epoch
+    EVAL_SEED = 40
+    torch.manual_seed(EVAL_SEED)
+    random.seed(EVAL_SEED)
+
     psnrs_step, ssims_step, lpips_step = [], [], []
     # optional per-epoch visualization of first batch progression
     save_seq = (save_per_epoch_dir is not None)
