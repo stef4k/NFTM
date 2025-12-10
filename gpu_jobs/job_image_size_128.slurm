@@ -37,6 +37,8 @@ python image_inpainting.py \
     --contract_w 0.0002701598741189249 \
     --guard_in_train \
     --save_metrics \
-    --batch_size 64
+    --batch_size 64 \
+    --save_dir out/unet_parallel_ep50_ktr23_kev24_celebahq_img128
+
 
 echo "=== DONE ==="
