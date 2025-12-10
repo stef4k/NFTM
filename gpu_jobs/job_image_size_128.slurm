@@ -15,11 +15,10 @@ conda activate nftm
 cd NFTM
 
 mkdir -p logs out $WORKDIR/.cache/torch/hub/checkpoints
-export WANDB__SERVICE_WAIT=300
-export WANDB_CONSOLE=wrap
 
 echo "=== Running single UNet inpainting experiment ==="
-echo "Job ID: $SLURM_JOB_ID"
+echo "Job ID: $SLURM_JOB_ID on $(hostname)"
+nvidia-smi
 
 # ----------------- Run the experiment -----------------
 python image_inpainting.py \
