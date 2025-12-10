@@ -198,7 +198,7 @@ Then download the datasets:
 
 - Set12: Download the dataset from [Kaggle](https://www.kaggle.com/datasets/leweihua/set12-231008), extract and place in `benchmarks/Set12/all_images/`
 
-- CBSD68: Download the dataset from [Kaggle](https://www.kaggle.com/datasets/tarekmebrouk/cbsd68), extract and place in `benchmarks/CBSD68/all_images/`
+- CBSD68: Download the dataset from [Kaggle](https://www.kaggle.com/datasets/tarekmebrouk/cbsd68), extract only the `train` folder and place it in `benchmarks/CBSD68/all_images/`
 
 2. **After setup, run benchmarks using:**
 
