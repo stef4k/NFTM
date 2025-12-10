@@ -144,15 +144,28 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
     return float(np.mean(losses)), float(np.mean(psnrs)), stats
 
 @torch.no_grad()
-def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
-               p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
-               corr_clip=0.2, descent_guard=False, tvw=0.0,
-               save_per_epoch_dir=None, epoch_tag=None, pyramid_sizes=None, 
-               steps_split=None, viz_scale: float = 1.0):
+def eval_steps(
+    controller,
+    loader,
+    device,
+    K_eval=10,
+    beta=0.6,
+    p_missing=(0.25, 0.5),
+    block_prob=0.5,
+    noise_std=0.3,
+    corr_clip=0.2,
+    descent_guard=False,
+    tvw=0.0,
+    save_per_epoch_dir=None,
+    epoch_tag=None,
+    pyramid_sizes=None,
+    steps_split=None,
+    viz_scale: float = 1.0,
+):
     controller.eval()
     psnrs_step, ssims_step, lpips_step = [], [], []
-    # optional per-epoch visualization of first batch progression
-    save_seq = (save_per_epoch_dir is not None)
+
+    save_seq = save_per_epoch_dir is not None
     if save_seq:
         ensure_dir(save_per_epoch_dir)
 
@@ -161,20 +174,40 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
         M = random_mask(imgs, p_missing=p_missing, block_prob=block_prob).to(device)
         I0 = corrupt_images(imgs, M, noise_std=noise_std)
         I = clamp_known(I0.clone(), imgs, M)
-        step_psnrs, step_ssims, step_lpips = [], [], []
 
+        step_psnrs, step_ssims, step_lpips = [], [], []
         gif_frames = []
         make_gif_frame = None
 
+        # ----------------- NEW: save GT + init per-sample -----------------
         if save_seq and bidx == 0:
             vis_rows = min(6, imgs.size(0))
+
+            # save GT and init images individually for first vis_rows samples
+            for r in range(vis_rows):
+                gt = imgs[r].detach().clamp(-1.0, 1.0)
+                init = I[r].detach().clamp(-1.0, 1.0)
+
+                gt = (gt + 1.0) / 2.0
+                init = (init + 1.0) / 2.0
+
+                tv.utils.save_image(
+                    gt,
+                    os.path.join(save_per_epoch_dir, f"sample_{r:03d}_gt.png"),
+                )
+                tv.utils.save_image(
+                    init,
+                    os.path.join(save_per_epoch_dir, f"sample_{r:03d}_init.png"),
+                )
+
+            # existing matplotlib grid
             cols = K_eval + 2
-            plt.figure(figsize=(3*cols, 3*vis_rows))
+            plt.figure(figsize=(3 * cols, 3 * vis_rows))
 
             def show_img(ax, x_tensor):
                 vis = upsample_for_viz(x_tensor, viz_scale)
-                ax.imshow(((vis.permute(1, 2, 0).cpu().numpy()+1)/2).clip(0,1))
-                ax.axis('off')
+                ax.imshow(((vis.permute(1, 2, 0).cpu().numpy() + 1) / 2).clip(0, 1))
+                ax.axis("off")
 
             gif_cols = min(8, imgs.size(0))
             gif_cols = max(gif_cols, 1)
@@ -189,15 +222,17 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
                 up_cur = upsample_for_viz(current, viz_scale)
                 panel = torch.cat([up_gt, up_cur], dim=0)
                 panel = ((panel + 1.0) * 0.5).clamp(0.0, 1.0)
-                grid = tv.utils.make_grid(panel, nrow=gif_cols, padding=2, pad_value=0.0)
+                grid = tv.utils.make_grid(
+                    panel, nrow=gif_cols, padding=2, pad_value=0.0
+                )
                 return (grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
             for r in range(vis_rows):
-                ax = plt.subplot(vis_rows, cols, r*cols+1)
+                ax = plt.subplot(vis_rows, cols, r * cols + 1)
                 show_img(ax, imgs[r])
                 if r == 0:
                     ax.set_title("GT")
-                ax = plt.subplot(vis_rows, cols, r*cols+2)
+                ax = plt.subplot(vis_rows, cols, r * cols + 2)
                 show_img(ax, I[r])
                 if r == 0:
                     ax.set_title("Init")
@@ -206,16 +241,13 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
                 init_frame = make_gif_frame(I.clamp(-1.0, 1.0))
                 if init_frame is not None:
                     gif_frames.append(init_frame)
+        # -------------------------------------------------------------
 
-        # BEFORE (conceptually):
-        # for s in range(K_eval): step at native resolution
-
-        # --- Multi-scale rollout (fills per-step curves) ---
         sizes = pyramid_sizes or [imgs.shape[-1]]
         steps_per = steps_split or split_steps_eval(K_eval, sizes)
 
         I = clamp_known(I0.clone(), imgs, M)
-        total_steps = 0  # to ensure we produce exactly K_eval entries
+        total_steps = 0
 
         for lvl, (S, T) in enumerate(zip(sizes, steps_per)):
             gt_S = imgs if S == imgs.shape[-1] else downsample_like(imgs, S)
@@ -227,46 +259,104 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
             corr_clip_S = corr_clip * scale_fac
 
             for s in range(T):
-                clip_decay = (0.92 ** s)
+                clip_decay = 0.92 ** s
                 if descent_guard:
                     I, _, _, _, _ = nftm_step_guarded(
-                        I, gt_S, M_S, controller, beta=beta_S, corr_clip=corr_clip_S,
-                        tvw=tvw, max_backtracks=3, shrink=0.5, clip_decay=clip_decay
+                        I,
+                        gt_S,
+                        M_S,
+                        controller,
+                        beta=beta_S,
+                        corr_clip=corr_clip_S,
+                        tvw=tvw,
+                        max_backtracks=3,
+                        shrink=0.5,
+                        clip_decay=clip_decay,
                     )
                 else:
-                    I, _ = nftm_step(I, gt_S, M_S, controller, beta=beta_S,
-                                     corr_clip=corr_clip_S, clip_decay=clip_decay)
-                    
-                if save_seq and bidx == 0:
-                    vis_rows = min(6, imgs.size(0))
-                    cols = K_eval + 2
-                    show_tensor = I if I.shape[-1] == imgs.shape[-1] else upsample_like(I, imgs.shape[-1])
-                    for r in range(vis_rows):
-                        ax = plt.subplot(vis_rows, cols, r*cols + (total_steps + 3))
-                        show_img(ax, show_tensor[r])
-                        if r == 0:
-                            ax.set_title(f"step {total_steps+1}")
+                    I, _ = nftm_step(
+                        I,
+                        gt_S,
+                        M_S,
+                        controller,
+                        beta=beta_S,
+                        corr_clip=corr_clip_S,
+                        clip_decay=clip_decay,
+                    )
 
-                # --- per-step metrics at native size ---
-                I_metrics = I if I.shape[-1] == imgs.shape[-1] else upsample_like(I, imgs.shape[-1])
+                # metrics at native res
+                I_metrics = (
+                    I
+                    if I.shape[-1] == imgs.shape[-1]
+                    else upsample_like(I, imgs.shape[-1])
+                )
                 I_metrics = I_metrics.clamp(-1.0, 1.0)
+
                 step_psnrs.append(_metric_psnr(I_metrics, imgs).item())
                 step_ssims.append(_metric_ssim(I_metrics, imgs).item())
                 step_lpips.append(_metric_lpips(I_metrics, imgs).item())
                 total_steps += 1
 
-                if save_seq and bidx == 0 and imageio is not None and make_gif_frame is not None:
+                # ------------- NEW: save per-step images -----------------
+                if save_seq and bidx == 0:
+                    vis_rows = min(6, imgs.size(0))
+                    vis = (I_metrics.detach().clamp(-1.0, 1.0) + 1.0) / 2.0
+                    for r in range(vis_rows):
+                        tv.utils.save_image(
+                            vis[r],
+                            os.path.join(
+                                save_per_epoch_dir,
+                                f"sample_{r:03d}_step_{total_steps:02d}.png",
+                            ),
+                        )
+                # ---------------------------------------------------------
+
+                if (
+                    save_seq
+                    and bidx == 0
+                    and imageio is not None
+                    and make_gif_frame is not None
+                ):
                     frame = make_gif_frame(I_metrics)
                     if frame is not None:
                         gif_frames.append(frame)
 
-            if S != sizes[-1]:
-                nextS = sizes[lvl+1]
-                I = upsample_like(I, nextS)
-                gt_next = imgs if nextS == imgs.shape[-1] else downsample_like(imgs, nextS)
-                M_next  = M if nextS == M.shape[-1] else downsample_mask_minpool(M, nextS)
-                I = clamp_known(I, gt_next, M_next)
+                if save_seq and bidx == 0:
+                    vis_rows = min(6, imgs.size(0))
+                    cols = K_eval + 2
+                    show_tensor = (
+                        I_metrics
+                        if I_metrics.shape[-1] == imgs.shape[-1]
+                        else upsample_like(I_metrics, imgs.shape[-1])
+                    )
+                    for r in range(vis_rows):
+                        ax = plt.subplot(
+                            vis_rows, cols, r * cols + (total_steps + 2)
+                        )
+                        vis_img = upsample_for_viz(show_tensor[r], viz_scale)
+                        ax.imshow(
+                            (
+                                (vis_img.permute(1, 2, 0).cpu().numpy() + 1) / 2
+                            ).clip(0, 1)
+                        )
+                        ax.axis("off")
+                        if r == 0:
+                            ax.set_title(f"step {total_steps}")
 
+            if S != sizes[-1]:
+                nextS = sizes[lvl + 1]
+                I = upsample_like(I, nextS)
+                gt_next = (
+                    imgs
+                    if nextS == imgs.shape[-1]
+                    else downsample_like(imgs, nextS)
+                )
+                M_next = (
+                    M
+                    if nextS == imgs.shape[-1]
+                    else downsample_mask_minpool(M, nextS)
+                )
+                I = clamp_known(I, gt_next, M_next)
 
         psnrs_step.append(step_psnrs)
         ssims_step.append(step_ssims)
@@ -282,7 +372,9 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
             if imageio is not None and gif_frames:
                 gif_path = os.path.join(save_per_epoch_dir, f"progress_{tag}.gif")
                 imageio.mimsave(gif_path, gif_frames, duration=0.4)
-                print(f"[gif] saved reconstruction GIF (GT top row, recon bottom) → {gif_path}")
+                print(
+                    f"[gif] saved reconstruction GIF (GT top row, recon bottom) → {gif_path}"
+                )
             elif imageio is None:
                 print("[gif] skipped GIF generation (imageio not installed)")
 
@@ -292,6 +384,7 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
         "lpips": np.array(lpips_step).mean(axis=0) if lpips_step else np.array([]),
     }
     return curves
+
 
 
 @torch.no_grad()
