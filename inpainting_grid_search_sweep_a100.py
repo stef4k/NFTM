@@ -17,9 +17,9 @@ print(f"[setup] Using cached Torch models from: {os.environ['TORCH_HOME']}")
 # Fixed configuration shared across sweeps
 # -------------------------
 fixed_config = {
-    "img_size": 64,
-    "benchmark": "celebahq",
-    "train_dataset": "celebahq",
+    "img_size": 32,
+    "benchmark": "cifar",
+    "train_dataset": "cifar",
 }
 
 # -------------------------
