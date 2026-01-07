@@ -121,10 +121,7 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
             # original behavior: only final fine output
             data_loss = F.mse_loss(I, imgs)
         # ----------------------------------------------------------
-
-        # Loss on final fine output
-        data_loss = F.mse_loss(I, imgs)
-
+        
         # Regularizers
         loss_smooth = tv_l1(I, tvw)
         contract = contract_w * (I - I_prev_for_contract).pow(2).mean()
