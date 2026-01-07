@@ -11,9 +11,12 @@
 # ----------------------------
 # Environment
 # ----------------------------
-source ~/venv/bin/activate
-export CUDA_VISIBLE_DEVICES=0
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
+source ~/.bashrc
+cd $WORKDIR
+conda activate nftm
+cd NFTM
+
 
 # ----------------------------
 # Reproducibility
