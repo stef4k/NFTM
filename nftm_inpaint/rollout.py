@@ -68,10 +68,61 @@ def split_steps_train(K_curr: int, sizes, epoch: int):
     steps[-1] += diff
     return steps
 
-def corrupt_images(img, M, noise_std=0.3):
-    # keep known pixels, corrupt others with noise
-    noise = torch.randn_like(img) * noise_std
-    return M*img + (1-M)*noise
+def corrupt_images(img, M, noise_std=0.3, noise_kind: str = "gaussian", **noise_kwargs):
+    """
+    Corrupt ONLY the missing region (1-M). Known pixels remain clean.
+
+    img: (B,3,H,W) in [-1,1]
+    M:   (B,1,H,W) known-mask with 1=known, 0=missing
+    Returns: corrupted image in [-1,1]
+
+    noise_kind supported:
+      - "gaussian": missing filled with N(0, noise_std)
+      - "uniform": missing filled with U(-1, 1)
+      - "saltpepper": missing filled with {-1, +1} with prob 'prob' else 0
+      - "poisson": missing filled with Poisson sampled (requires 'peak', uses [0,1] mapping)
+      - "speckle": missing filled with multiplicative noise around 0 (uses noise_std)
+    """
+    kind = (noise_kind or "gaussian").lower()
+    B, C, H, W = img.shape
+    device = img.device
+    dtype = img.dtype
+
+    if kind == "gaussian":
+        corrupt = torch.randn_like(img) * float(noise_std)
+
+    elif kind == "uniform":
+        corrupt = (torch.rand_like(img) * 2.0 - 1.0)
+
+    elif kind == "saltpepper":
+        prob = float(noise_kwargs.get("prob", 0.10))
+        u = torch.rand_like(img)
+        corrupt = torch.zeros_like(img)
+        corrupt = torch.where(u < (prob / 2.0), torch.ones_like(corrupt), corrupt)
+        corrupt = torch.where(u > (1.0 - prob / 2.0), -torch.ones_like(corrupt), corrupt)
+
+    elif kind == "poisson":
+        # Shot-noise-like fill: sample Poisson on [0,1] then map back to [-1,1]
+        peak = float(noise_kwargs.get("peak", 30.0))  # higher peak => less noise
+        x01 = ((img.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+        lam = (x01 * peak).clamp_min(0.0)
+        samp = torch.poisson(lam) / peak
+        corrupt = (samp * 2.0 - 1.0).to(dtype=dtype)
+
+    elif kind == "speckle":
+        # multiplicative gaussian around 0 -> bounded
+        n = torch.randn_like(img) * float(noise_std)
+        corrupt = (img + img * n)
+
+    else:
+        raise ValueError(f"Unknown noise_kind: {noise_kind}")
+
+    # clamp for safety (keeps controller input sane)
+    corrupt = corrupt.clamp(-1.0, 1.0)
+
+    # keep known pixels, corrupt missing pixels
+    return M * img + (1 - M) * corrupt
+
 
 def clamp_known(I, I_gt, M):
     # enforce known pixels to match ground truth (hard measurement)
