@@ -80,6 +80,7 @@ def main():
     parser.add_argument("--step_loss", type=str, default="final", choices=["final", "linear"], help="How to accumulate data loss over rollout steps: ""'final' = only final output, 'linear' = linearly weighted per-step losses.")
     parser.add_argument("--eval_noise_sweep", action="store_true",
                     help="Run eval over multiple corruption noise types and save per-noise visuals + metrics.")
+    parser.add_argument("--gaussian_additive", action="store_true", help="Use additive Gaussian corruption inside missing region: (img + N(0,std)) instead of replacement N(0,std). WARNING: uses ground truth inside the hole (not a pure inpainting setting).")
 
     args = parser.parse_args()
 
@@ -185,7 +186,9 @@ def main():
             guard_in_train=args.guard_in_train,
             contract_w=args.contract_w, rollout_bias=True,
             pyramid_sizes=pyr_sizes,
-            step_loss_mode=args.step_loss
+            step_loss_mode=args.step_loss,
+            gaussian_additive=args.gaussian_additive,
+
         )
 
         curves = eval_steps(

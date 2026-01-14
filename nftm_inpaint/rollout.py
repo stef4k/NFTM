@@ -68,7 +68,7 @@ def split_steps_train(K_curr: int, sizes, epoch: int):
     steps[-1] += diff
     return steps
 
-def corrupt_images(img, M, noise_std=0.3, noise_kind: str = "gaussian", **noise_kwargs):
+def corrupt_images(img, M, noise_std=0.3, noise_kind: str = "gaussian", gaussian_additive: bool = False, **noise_kwargs):
     """
     Corrupt ONLY the missing region (1-M). Known pixels remain clean.
 
@@ -89,7 +89,8 @@ def corrupt_images(img, M, noise_std=0.3, noise_kind: str = "gaussian", **noise_
     dtype = img.dtype
 
     if kind == "gaussian":
-        corrupt = torch.randn_like(img) * float(noise_std)
+        eps = torch.randn_like(img) * float(noise_std)
+        corrupt = (img + eps) if gaussian_additive else eps
 
     elif kind == "uniform":
         corrupt = (torch.rand_like(img) * 2.0 - 1.0)
