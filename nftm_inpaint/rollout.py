@@ -89,7 +89,9 @@ def corrupt_images(img, M, noise_std=0.3, noise_kind: str = "gaussian", gaussian
     dtype = img.dtype
 
     if kind == "gaussian":
+        # create tensor with zero-mean Gaussian noise with standard deviation noise_std
         eps = torch.randn_like(img) * float(noise_std)
+        # pure noise if not gaussian_additive; else additive noise
         corrupt = (img + eps) if gaussian_additive else eps
 
     elif kind == "uniform":

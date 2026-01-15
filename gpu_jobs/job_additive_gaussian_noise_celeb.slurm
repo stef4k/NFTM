@@ -2,7 +2,7 @@
 #SBATCH --job-name=unet_single_64_additive_noise
 #SBATCH --output=logs/unet_single_img64_additive_noise_%A.out
 #SBATCH --error=logs/unet_single_img64_additive_noise_%A.err
-#SBATCH --partition=gpu
+#SBATCH --partition=gpua100
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=16G

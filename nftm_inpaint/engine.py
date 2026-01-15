@@ -317,6 +317,7 @@ def evaluate_metrics_full(
     pyramid_sizes=None,
     steps_split=None,
     noise_kind: str = "gaussian",
+    gaussian_additive: bool = False,
     noise_kwargs: dict | None = None,
 ):
     controller.eval()
@@ -335,7 +336,7 @@ def evaluate_metrics_full(
     for imgs, _ in loader:
         imgs = imgs.to(device, non_blocking=True)
         M = random_mask(imgs, p_missing=p_missing, block_prob=block_prob).to(device)
-        I0 = corrupt_images(imgs, M, noise_std=noise_std, noise_kind=noise_kind, **(noise_kwargs or {}))
+        I0 = corrupt_images(imgs, M, noise_std=noise_std, noise_kind=noise_kind, gaussian_additive=gaussian_additive,**(noise_kwargs or {}))
 
 
         # multi-scale rollout, same as eval_steps()

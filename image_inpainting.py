@@ -199,7 +199,8 @@ def main():
             descent_guard=False, tvw=0.0,
             save_per_epoch_dir=steps_dir, epoch_tag=ep,
             pyramid_sizes=pyr_sizes, steps_split=pyr_steps_eval,
-            viz_scale=max(1.0, float(args.viz_scale))
+            viz_scale=max(1.0, float(args.viz_scale)),
+            gaussian_additive=args.gaussian_additive
         )
 
         psnr_curve = curves["psnr"]
@@ -264,7 +265,8 @@ def main():
         save_per_epoch_dir=os.path.join(args.save_dir, "final"),
         epoch_tag="final",
         pyramid_sizes=pyr_sizes, steps_split=pyr_steps_eval,
-        viz_scale=max(1.0, float(args.viz_scale))
+        viz_scale=max(1.0, float(args.viz_scale)),
+        gaussian_additive=args.gaussian_additive
     )
     print("[done] checkpoints and plots saved under:", args.save_dir, f"| controller={args.controller}")
 
@@ -285,6 +287,7 @@ def main():
             benchmark=benchmark,
             pyramid_sizes=pyr_sizes,
             steps_split=pyr_steps_eval,
+            gaussian_additive=args.gaussian_additive
         )
         if psnr_curve is not None and psnr_curve.size > 0:
             np.save(os.path.join(args.save_dir, "psnr_curve.npy"), psnr_curve)
@@ -370,6 +373,7 @@ def main():
                 pyramid_sizes=pyr_sizes, steps_split=pyr_steps_eval,
                 viz_scale=max(1.0, float(args.viz_scale)),
                 noise_kind=noise_kind, noise_kwargs=noise_kwargs,
+                gaussian_additive=args.gaussian_additive
             )
 
             # Save full metrics
@@ -390,6 +394,7 @@ def main():
                 steps_split=pyr_steps_eval,
                 noise_kind=noise_kind,
                 noise_kwargs=noise_kwargs,
+                gaussian_additive=args.gaussian_additive
             )
 
             all_results[tag] = metrics_full
