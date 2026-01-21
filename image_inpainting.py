@@ -26,7 +26,7 @@ from nftm_inpaint.metrics import ssim as _metric_ssim
 from nftm_inpaint.metrics import (fid_init, fid_update, fid_compute,
                      kid_init, kid_update, kid_compute)
 from nftm_inpaint.unet_model import TinyUNet
-# import wandb
+import wandb
 
 # bring in our split pieces
 from nftm_inpaint.data_and_viz import set_seed, get_transform, ensure_dir, plot_metric_curve
