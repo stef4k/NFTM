@@ -30,7 +30,7 @@ from nftm_inpaint.data_and_viz import random_mask  # data helper
 def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 tvw=0.01, p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
                 corr_clip=0.2, guard_in_train=True, contract_w=1e-3, rollout_bias=True, pyramid_sizes=None,
-                step_loss_mode: str = "final"):
+                step_loss_mode: str = "final",  gaussian_additive: bool = False):
     controller.train()
     psnrs, losses = [], []
     accepted_steps, backtracks = 0, 0
@@ -42,7 +42,7 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
     for imgs, _ in loader:
         imgs = imgs.to(device, non_blocking=True)  # ground truth in [-1,1]
         M = random_mask(imgs, p_missing=p_missing, block_prob=block_prob).to(device)
-        I0 = corrupt_images(imgs, M, noise_std=noise_std)
+        I0 = corrupt_images(imgs, M, noise_std=noise_std, gaussian_additive=gaussian_additive)
         I = clamp_known(I0.clone(), imgs, M)
 
         # random rollout depth (bias early epochs to short rollouts)
@@ -145,7 +145,7 @@ def eval_steps(controller, loader, device, K_eval=10,
                corr_clip=0.2, descent_guard=False, tvw=0.0,
                save_per_epoch_dir=None, epoch_tag=None, pyramid_sizes=None, 
                steps_split=None, viz_scale: float = 1.0,
-               noise_kind: str = "gaussian", noise_kwargs: dict | None = None):
+               noise_kind: str = "gaussian", noise_kwargs: dict | None = None, gaussian_additive: bool = False):
     controller.eval()
 
     # same masks + noise every epoch
@@ -162,7 +162,8 @@ def eval_steps(controller, loader, device, K_eval=10,
     for bidx, (imgs, _) in enumerate(loader):
         imgs = imgs.to(device, non_blocking=True)
         M = random_mask(imgs, p_missing=p_missing, block_prob=block_prob).to(device)
-        I0 = corrupt_images(imgs, M, noise_std=noise_std, noise_kind=noise_kind, **(noise_kwargs or {}))
+        I0 = corrupt_images(imgs, M, noise_std=noise_std, noise_kind=noise_kind, **(noise_kwargs or {}),
+                            gaussian_additive=gaussian_additive)
         I = clamp_known(I0.clone(), imgs, M)
         step_psnrs, step_ssims, step_lpips = [], [], []
 
@@ -328,6 +329,7 @@ def evaluate_metrics_full(
     pyramid_sizes=None,
     steps_split=None,
     noise_kind: str = "gaussian",
+    gaussian_additive: bool = False,
     noise_kwargs: dict | None = None,
 ):
     controller.eval()
@@ -346,7 +348,7 @@ def evaluate_metrics_full(
     for imgs, _ in loader:
         imgs = imgs.to(device, non_blocking=True)
         M = random_mask(imgs, p_missing=p_missing, block_prob=block_prob).to(device)
-        I0 = corrupt_images(imgs, M, noise_std=noise_std, noise_kind=noise_kind, **(noise_kwargs or {}))
+        I0 = corrupt_images(imgs, M, noise_std=noise_std, noise_kind=noise_kind, gaussian_additive=gaussian_additive,**(noise_kwargs or {}))
 
 
         # multi-scale rollout, same as eval_steps()
