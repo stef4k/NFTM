@@ -48,10 +48,6 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--K_train", type=int, default=8, help="max rollout steps for training curriculum")
     parser.add_argument("--K_eval", type=int, default=12, help="rollout steps for evaluation")
-    parser.add_argument("--beta_start", type=float, default=0.28, help="initial beta (step size)")
-    parser.add_argument("--beta_max", type=float, default=0.6, help="cap on beta during training")
-    parser.add_argument("--beta_anneal", type=float, default=0.03, help="per-epoch beta increment")
-    parser.add_argument("--beta_eval_bonus", type=float, default=0.05, help="extra beta for eval")
     parser.add_argument("--tv_weight", type=float, default=0.01)
     parser.add_argument("--corr_clip", type=float, default=0.1, help="max per-step correction magnitude (base)")
     parser.add_argument("--pmin", type=float, default=0.25, help="min missing fraction")
@@ -175,12 +171,9 @@ def main():
 
     # Train
     for ep in range(1, args.epochs+1):
-        beta = min(args.beta_start + args.beta_anneal * (ep-1), args.beta_max)
-        beta_eval = min(beta + args.beta_eval_bonus, 0.9)
-
         train_loss, train_psnr, stats = train_epoch(
             controller, opt, train_loader, device, epoch=ep,
-            K_target=args.K_train, K_base=4, beta=beta, beta_max=args.beta_max, tvw=args.tv_weight,
+            K_target=args.K_train, K_base=4, tvw=args.tv_weight,
             p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
             noise_std=args.noise_std, corr_clip=args.corr_clip,
             guard_in_train=args.guard_in_train,
@@ -193,7 +186,7 @@ def main():
 
         curves = eval_steps(
             controller, test_loader, device,
-            K_eval=args.K_eval, beta=beta_eval,
+            K_eval=args.K_eval,
             p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
             noise_std=args.noise_std, corr_clip=args.corr_clip,
             descent_guard=False, tvw=0.0,
@@ -214,7 +207,7 @@ def main():
         else:
             curve_str = "n/a"
             tail_val = "n/a"
-        msg = (f"[ep {ep:02d}] β_train={beta:.3f} K_train={stats['train_K']} | loss {train_loss:.4f} | "
+        msg = (f"[ep {ep:02d}] K_train={stats['train_K']} | loss {train_loss:.4f} | "
                f"train PSNR {train_psnr:.2f} dB | eval PSNR 1..{args.K_eval}: {curve_str} ... {tail_val} | "
                f"ctrl={args.controller}")
         if ssim_curve.size > 0 and lpips_curve.size > 0:
@@ -235,8 +228,6 @@ def main():
                 "train/psnr": train_psnr,
                 "eval/psnr_final": float(psnr_curve[-1]) if psnr_curve.size > 0 else None,
                 "eval/ssim_final": float(ssim_curve[-1]) if ssim_curve.size > 0 else None,
-                "eval/lpips_final": float(lpips_curve[-1]) if lpips_curve.size > 0 else None,
-                "beta": beta,
                 "K_train": stats["train_K"],
                 "controller": args.controller,
             })
@@ -252,13 +243,9 @@ def main():
         plot_metric_curve(lpips_curve, os.path.join(args.save_dir, "lpips_curve.png"),
                           "LPIPS", "Step-wise LPIPS (eval)")
 
-    # Save a final sample grid (progression of first test batch)
-    final_beta = min(args.beta_start + args.beta_anneal * (args.epochs-1), args.beta_max)
-    beta_eval_final = min(final_beta + args.beta_eval_bonus, 0.9)
-
     _ = eval_steps(
         controller, test_loader, device,
-        K_eval=args.K_eval, beta=beta_eval_final,
+        K_eval=args.K_eval,
         p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
         noise_std=args.noise_std, corr_clip=args.corr_clip,
         descent_guard=False, tvw=0.0,
@@ -277,7 +264,6 @@ def main():
             test_loader,
             device,
             K_eval=args.K_eval,
-            beta=beta_eval_final,
             p_missing=(args.pmin, args.pmax),
             block_prob=args.block_prob,
             noise_std=args.noise_std,
@@ -299,10 +285,6 @@ def main():
             epochs=args.epochs,
             K_train=args.K_train,
             K_eval=args.K_eval,
-            beta_start=args.beta_start,
-            beta_max=args.beta_max,
-            beta_anneal=args.beta_anneal,
-            beta_eval_bonus=args.beta_eval_bonus,
             corr_clip=args.corr_clip,
             tv_weight=args.tv_weight,
             pmin=args.pmin, pmax=args.pmax, block_prob=args.block_prob,
