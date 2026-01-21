@@ -74,7 +74,8 @@ def main():
     parser.add_argument("--pyr_steps", type=str, default="", help="comma-separated rollout steps per level summing to K_eval (e.g., '3,9'). Empty = auto split.")
     parser.add_argument("--viz_scale", type=float, default=1.0, help="Visualization upsample scale for PNG/GIF (1.0 = native, 2.0 = 2×).")
     parser.add_argument("--step_loss", type=str, default="final", choices=["final", "linear"], help="How to accumulate data loss over rollout steps: ""'final' = only final output, 'linear' = linearly weighted per-step losses.")
-
+    parser.add_argument("--eval_noise_sweep", action="store_true",
+                    help="Run eval over multiple corruption noise types and save per-noise visuals + metrics.")
 
     args = parser.parse_args()
 
@@ -302,6 +303,83 @@ def main():
         with open(os.path.join(args.save_dir, "metrics.json"), "w") as f:
             json.dump(summary, f, indent=2)
         print(f"[metrics] saved metrics.json & psnr_curve.npy in {args.save_dir} | controller={args.controller}")
+    
+
+        # ---------------- Noise generalization sweep (EVAL ONLY) ----------------
+    if args.eval_noise_sweep:
+        sweep = [
+            ("gaussian",     {"noise_std": args.noise_std}),
+            ("uniform",      {}),
+            ("saltpepper",   {"prob": 0.10}),
+            ("saltpepper",   {"prob": 0.20}),
+            ("poisson",      {"peak": 30.0}),
+            ("poisson",      {"peak": 10.0}),
+            ("speckle",      {"noise_std": 0.20}),
+        ]
+
+        sweep_dir = os.path.join(args.save_dir, "noise_sweep")
+        ensure_dir(sweep_dir)
+
+        beta_eval_sweep = beta_eval_final  # reuse final beta
+        all_results = {}
+
+        for noise_kind, kw in sweep:
+            tag_parts = [noise_kind]
+            for k, v in kw.items():
+                tag_parts.append(f"{k}{v}")
+            tag = "_".join(tag_parts)
+
+            out_dir = os.path.join(sweep_dir, tag)
+            ensure_dir(out_dir)
+
+            # allow per-noise override of noise_std
+            noise_std_use = float(kw.get("noise_std", args.noise_std))
+            noise_kwargs = dict(kw)
+            noise_kwargs.pop("noise_std", None)
+
+            # Save progression grid/GIF for first batch
+            _ = eval_steps(
+                controller, test_loader, device,
+                K_eval=args.K_eval, beta=beta_eval_sweep,
+                p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
+                noise_std=noise_std_use, corr_clip=args.corr_clip,
+                descent_guard=False, tvw=0.0,
+                save_per_epoch_dir=out_dir,
+                epoch_tag=f"noise_{tag}",
+                pyramid_sizes=pyr_sizes, steps_split=pyr_steps_eval,
+                viz_scale=max(1.0, float(args.viz_scale)),
+                noise_kind=noise_kind, noise_kwargs=noise_kwargs,
+            )
+
+            # Save full metrics
+            metrics_full = evaluate_metrics_full(
+                controller,
+                test_loader,
+                device,
+                K_eval=args.K_eval,
+                beta=beta_eval_sweep,
+                p_missing=(args.pmin, args.pmax),
+                block_prob=args.block_prob,
+                noise_std=noise_std_use,
+                corr_clip=args.corr_clip,
+                descent_guard=False,
+                tvw=0.0,
+                benchmark=benchmark,
+                pyramid_sizes=pyr_sizes,
+                steps_split=pyr_steps_eval,
+                noise_kind=noise_kind,
+                noise_kwargs=noise_kwargs,
+            )
+
+            all_results[tag] = metrics_full
+            with open(os.path.join(out_dir, "metrics.json"), "w") as f:
+                json.dump(metrics_full, f, indent=2)
+
+        with open(os.path.join(sweep_dir, "noise_sweep.json"), "w") as f:
+            json.dump(all_results, f, indent=2)
+
+        print("[noise-sweep] saved per-noise visuals + metrics under:", sweep_dir)
+        
     if log_with_wandb:
     # Finish logging
         wandb.log({

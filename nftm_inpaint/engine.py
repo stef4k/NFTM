@@ -119,8 +119,8 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
         else:
             # original behavior: only final fine output
             data_loss = F.mse_loss(I, imgs)
-        # ----------------------------------------------------------
-        
+
+
         # Regularizers
         loss_smooth = tv_l1(I, tvw)
         contract = contract_w * (I - I_prev_for_contract).pow(2).mean()
@@ -144,7 +144,8 @@ def eval_steps(controller, loader, device, K_eval=10,
                p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
                corr_clip=0.2, descent_guard=False, tvw=0.0,
                save_per_epoch_dir=None, epoch_tag=None, pyramid_sizes=None, 
-               steps_split=None, viz_scale: float = 1.0):
+               steps_split=None, viz_scale: float = 1.0,
+               noise_kind: str = "gaussian", noise_kwargs: dict | None = None):
     controller.eval()
 
     # same masks + noise every epoch
@@ -161,7 +162,7 @@ def eval_steps(controller, loader, device, K_eval=10,
     for bidx, (imgs, _) in enumerate(loader):
         imgs = imgs.to(device, non_blocking=True)
         M = random_mask(imgs, p_missing=p_missing, block_prob=block_prob).to(device)
-        I0 = corrupt_images(imgs, M, noise_std=noise_std)
+        I0 = corrupt_images(imgs, M, noise_std=noise_std, noise_kind=noise_kind, **(noise_kwargs or {}))
         I = clamp_known(I0.clone(), imgs, M)
         step_psnrs, step_ssims, step_lpips = [], [], []
 
@@ -326,6 +327,8 @@ def evaluate_metrics_full(
     benchmark=None,
     pyramid_sizes=None,
     steps_split=None,
+    noise_kind: str = "gaussian",
+    noise_kwargs: dict | None = None,
 ):
     controller.eval()
     totals = {
@@ -343,7 +346,8 @@ def evaluate_metrics_full(
     for imgs, _ in loader:
         imgs = imgs.to(device, non_blocking=True)
         M = random_mask(imgs, p_missing=p_missing, block_prob=block_prob).to(device)
-        I0 = corrupt_images(imgs, M, noise_std=noise_std)
+        I0 = corrupt_images(imgs, M, noise_std=noise_std, noise_kind=noise_kind, **(noise_kwargs or {}))
+
 
         # multi-scale rollout, same as eval_steps()
         sizes = pyramid_sizes or [imgs.shape[-1]]
