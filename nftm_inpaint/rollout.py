@@ -92,30 +92,38 @@ def energy(I, I_gt, tvw=0.01):
     data_term = F.mse_loss(I, I_gt)
     return data_term + tv_l1(I, tvw)
 
-def nftm_step(I, I_gt, M, controller, beta=0.5, corr_clip=0.2, clip_decay=1.0):
+def nftm_step(I, I_gt, M, controller, beta=0.5, corr_clip=0.2, clip_decay=1.0, return_gate=False):
     """One step without guard; returns (I_new, logS)."""
-    dI, gate, logS = controller(I, M)
-    dI = dI.clamp(-corr_clip*clip_decay, corr_clip*clip_decay)
-    I_new = I + beta * gate * dI
-    I_new = clamp_known(I_new, I_gt, M)
+    dI, _gate, logS = controller(I, M)
+    dI = dI.clamp(-corr_clip * clip_decay, corr_clip * clip_decay)
+
+    I_prop = I + dI
+    I_new = clamp_known(I_prop, I_gt, M)
     return I_new, logS
 
-def nftm_step_guarded(I, I_gt, M, controller, beta, corr_clip=0.2, tvw=0.01,
+def nftm_step_guarded(I, I_gt, M, controller, corr_clip=0.2, tvw=0.01,
                       max_backtracks=3, shrink=0.5, clip_decay=1.0):
-    """Try a step; if energy ↑, shrink beta and retry."""
     with torch.no_grad():
         E0 = energy(I, I_gt, tvw=tvw)
-    cur_beta = beta
-    for _ in range(max_backtracks+1):
-        I_prop, logS = nftm_step(I, I_gt, M, controller, beta=cur_beta,
-                                 corr_clip=corr_clip, clip_decay=clip_decay)
+
+    cur_clip = corr_clip
+    last_I_prop, last_logS, last_clip = I, None, cur_clip
+    last_dE = 0.0
+
+    for _ in range(max_backtracks + 1):
+        I_prop, logS = nftm_step(I, I_gt, M, controller, corr_clip=cur_clip, clip_decay=clip_decay)
+
         with torch.no_grad():
             E1 = energy(I_prop, I_gt, tvw=tvw)
+
         if E1 <= E0:
-            return I_prop, logS, cur_beta, True, float(E1 - E0)
-        cur_beta *= shrink
-    # give up: return original (reject)
-    return I, torch.zeros_like(I), cur_beta, False, 0.0
+            return I_prop, logS, cur_clip, True, float(E1 - E0)
+
+        last_I_prop, last_logS, last_clip = I_prop, logS, cur_clip
+        last_dE = float(E1 - E0)
+        cur_clip *= shrink
+
+    return last_I_prop, last_logS, last_clip, False, last_dE
 
 def count_params(m):
     return sum(p.numel() for p in m.parameters() if p.requires_grad)

@@ -28,7 +28,7 @@ from nftm_inpaint.data_and_viz import ensure_dir, upsample_for_viz
 from nftm_inpaint.data_and_viz import random_mask  # data helper
 
 def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
-                beta=0.4, beta_max=0.6, tvw=0.01, p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
+                tvw=0.01, p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
                 corr_clip=0.2, guard_in_train=True, contract_w=1e-3, rollout_bias=True, pyramid_sizes=None,
                 step_loss_mode: str = "final"):
     controller.train()
@@ -80,7 +80,6 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
             I = I if I.shape[-1] == S else downsample_like(I, S)
 
             scale_fac = float(sizes[-1]) / float(S)
-            beta_S = min(beta * scale_fac, beta_max)
             corr_clip_S = corr_clip * scale_fac
 
             for s in range(T):
@@ -88,7 +87,7 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 if guard_in_train:
                     I, _, _used_beta, ok, _dE = nftm_step_guarded(
                         I, gt_S, M_S, controller,
-                        beta=beta_S, corr_clip=corr_clip_S,
+                        corr_clip=corr_clip_S,
                         tvw=0.0, max_backtracks=2, shrink=0.5, clip_decay=clip_decay
                     )
                     accepted_steps += int(ok)
@@ -96,7 +95,7 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 else:
                     I, _ = nftm_step(
                         I, gt_S, M_S, controller,
-                        beta=beta_S, corr_clip=corr_clip_S, clip_decay=clip_decay
+                        corr_clip=corr_clip_S, clip_decay=clip_decay
                     )
                 # ----- NEW: accumulate per-step MSE with linear weights -----
                 if use_linear_steps:
@@ -141,7 +140,7 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
     return float(np.mean(losses)), float(np.mean(psnrs)), stats
 
 @torch.no_grad()
-def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
+def eval_steps(controller, loader, device, K_eval=10,
                p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
                corr_clip=0.2, descent_guard=False, tvw=0.0,
                save_per_epoch_dir=None, epoch_tag=None, pyramid_sizes=None, 
@@ -172,7 +171,8 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
         if save_seq and bidx == 0:
             vis_rows = min(6, imgs.size(0))
             cols = K_eval + 2
-            plt.figure(figsize=(3*cols, 3*vis_rows))
+            rows = vis_rows
+            plt.figure(figsize=(3*cols, 3*rows))
 
             def show_img(ax, x_tensor):
                 vis = upsample_for_viz(x_tensor, viz_scale)
@@ -190,25 +190,26 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
                 gt = gif_gt.clamp(-1.0, 1.0)
                 up_gt = upsample_for_viz(gt, viz_scale)
                 up_cur = upsample_for_viz(current, viz_scale)
-                panel = torch.cat([up_gt, up_cur], dim=0)
+
+                panels = [up_gt, up_cur]  # 2 rows: GT, Recon
+                panel = torch.cat(panels, dim=0)
                 panel = ((panel + 1.0) * 0.5).clamp(0.0, 1.0)
                 grid = tv.utils.make_grid(panel, nrow=gif_cols, padding=2, pad_value=0.0)
                 return (grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
             for r in range(vis_rows):
-                ax = plt.subplot(vis_rows, cols, r*cols+1)
+                ax = plt.subplot(rows, cols, r*cols + 1)
                 show_img(ax, imgs[r])
-                if r == 0:
-                    ax.set_title("GT")
-                ax = plt.subplot(vis_rows, cols, r*cols+2)
+                if r == 0: ax.set_title("GT")
+
+                ax = plt.subplot(rows, cols, r*cols + 2)
                 show_img(ax, I[r])
-                if r == 0:
-                    ax.set_title("Init")
+                if r == 0: ax.set_title("Init")
 
             if imageio is not None:
                 init_frame = make_gif_frame(I.clamp(-1.0, 1.0))
                 if init_frame is not None:
-                    gif_frames.append(init_frame)
+                    gif_frames.append(init_frame)   
 
         # BEFORE (conceptually):
         # for s in range(K_eval): step at native resolution
@@ -220,32 +221,44 @@ def eval_steps(controller, loader, device, K_eval=10, beta=0.6,
         I = clamp_known(I0.clone(), imgs, M)
         total_steps = 0  # to ensure we produce exactly K_eval entries
 
+        gate_stats = []
+
         for lvl, (S, T) in enumerate(zip(sizes, steps_per)):
             gt_S = imgs if S == imgs.shape[-1] else downsample_like(imgs, S)
             M_S = M if S == imgs.shape[-1] else downsample_mask_minpool(M, S)
             I = I if I.shape[-1] == S else downsample_like(I, S)
 
             scale_fac = float(sizes[-1]) / float(S)
-            beta_S = min(beta * scale_fac, 0.9)
             corr_clip_S = corr_clip * scale_fac
 
             for s in range(T):
                 clip_decay = (0.92 ** s)
                 if descent_guard:
                     I, _, _, _, _ = nftm_step_guarded(
-                        I, gt_S, M_S, controller, beta=beta_S, corr_clip=corr_clip_S,
+                        I, gt_S, M_S, controller, corr_clip=corr_clip_S,
                         tvw=tvw, max_backtracks=3, shrink=0.5, clip_decay=clip_decay
                     )
+                    gate = None
+                    dI = None
                 else:
-                    I, _ = nftm_step(I, gt_S, M_S, controller, beta=beta_S,
-                                     corr_clip=corr_clip_S, clip_decay=clip_decay)
+                    if save_seq and bidx == 0:
+                        I, _ = nftm_step(
+                            I, gt_S, M_S, controller,
+                            corr_clip=corr_clip_S, clip_decay=clip_decay
+                        )
+                    else:
+                        I, _ = nftm_step(
+                            I, gt_S, M_S, controller,
+                            corr_clip=corr_clip_S, clip_decay=clip_decay
+                        )
+
                     
                 if save_seq and bidx == 0:
                     vis_rows = min(6, imgs.size(0))
                     cols = K_eval + 2
                     show_tensor = I if I.shape[-1] == imgs.shape[-1] else upsample_like(I, imgs.shape[-1])
                     for r in range(vis_rows):
-                        ax = plt.subplot(vis_rows, cols, r*cols + (total_steps + 3))
+                        ax = plt.subplot(rows, cols, r*cols + (total_steps + 3))
                         show_img(ax, show_tensor[r])
                         if r == 0:
                             ax.set_title(f"step {total_steps+1}")
@@ -304,7 +317,6 @@ def evaluate_metrics_full(
     device,
     *,
     K_eval: int,
-    beta: float,
     p_missing=(0.25, 0.5),
     block_prob=0.5,
     noise_std=0.3,
@@ -345,18 +357,17 @@ def evaluate_metrics_full(
             I    = I if I.shape[-1] == S else downsample_like(I, S)
 
             scale_fac = float(sizes[-1]) / float(S)
-            beta_S = min(beta * scale_fac, 0.9)
             corr_clip_S = corr_clip * scale_fac
 
             for s in range(T):
                 clip_decay = 0.92 ** s
                 if descent_guard:
                     I, _, _, _, _ = nftm_step_guarded(I, gt_S, M_S, controller,
-                                                      beta=beta_S, corr_clip=corr_clip_S,
+                                                      corr_clip=corr_clip_S,
                                                       tvw=tvw, max_backtracks=3, shrink=0.5,
                                                       clip_decay=clip_decay)
                 else:
-                    I, _ = nftm_step(I, gt_S, M_S, controller, beta=beta_S,
+                    I, _ = nftm_step(I, gt_S, M_S, controller,
                                      corr_clip=corr_clip_S, clip_decay=clip_decay)
 
             # upsample hand-off with size-matched clamp
