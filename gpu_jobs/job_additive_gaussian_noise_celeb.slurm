@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=unet_single_64_additive_noise
-#SBATCH --output=logs/unet_single_img64_additive_noise_%A.out
-#SBATCH --error=logs/unet_single_img64_additive_noise_%A.err
+#SBATCH --job-name=unet_single_64_additive_noise_denoising
+#SBATCH --output=logs/unet_single_img64_additive_noise_denoising_%A.out
+#SBATCH --error=logs/unet_single_img64_additive_noise_denoising_%A.err
 #SBATCH --partition=gpua100
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=6
@@ -36,10 +36,13 @@ python image_inpainting.py \
   --corr_clip 0.3257 \
   --tv_weight 0.0020 \
   --seed 0 \
+  --pmin 1 \
+  --pmax 1 \
+  --block_prob 0 \
   --device cuda \
   --save_metrics \
   --save_epoch_progress \
-  --save_dir out/unet_additive_noise_try_elebahq_img64 \
+  --save_dir out/unet_additive_noise_try_celebahq_denoising \
   --gaussian_additive
 
 
