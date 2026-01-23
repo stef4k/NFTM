@@ -28,6 +28,7 @@ from nftm_inpaint.data_and_viz import ensure_dir, upsample_for_viz
 from nftm_inpaint.data_and_viz import random_mask  # data helper
 
 def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
+                beta: float | None = None, beta_max: float | None = None, gate: bool = False,
                 tvw=0.01, p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
                 corr_clip=0.2, guard_in_train=True, contract_w=1e-3, rollout_bias=True, pyramid_sizes=None,
                 step_loss_mode: str = "final",  gaussian_additive: bool = False):
@@ -36,7 +37,8 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
     accepted_steps, backtracks = 0, 0
 
     # curriculum on rollout depth: grow K_train with epochs
-    K_train = min(K_target, K_base + epoch)
+    # K_train = min(K_target, K_base + epoch)
+    K_train = K_target
     sizes_default = pyramid_sizes if pyramid_sizes else None
 
     for imgs, _ in loader:
@@ -50,9 +52,11 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
             lengths = list(range(1, K_train+1))
             weights = torch.tensor([0.6*(0.7**(t-1)) for t in lengths])
             weights = (weights / weights.sum()).to(device='cpu')
-            K_curr = int(torch.multinomial(weights, 1).item() + 1)  # 1..K_train
+            # K_curr = int(torch.multinomial(weights, 1).item() + 1)  # 1..K_train
+            K_curr = K_target
         else:
-            K_curr = random.randint(1, K_train)
+            # K_curr = random.randint(1, K_train)
+            K_curr = K_target
 
         sizes = sizes_default or [imgs.shape[-1]]
         steps_per = split_steps_train(K_curr, sizes, epoch=epoch)
@@ -84,9 +88,17 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
 
             for s in range(T):
                 clip_decay = (0.92 ** s)
+
+                if beta is None:
+                    beta_S = None  # nftm_step treats None as 1.0
+                else:
+                    cap = 0.9 if beta_max is None else float(beta_max)
+                    beta_S = min(float(beta) * scale_fac, cap)
+
                 if guard_in_train:
                     I, _, _used_beta, ok, _dE = nftm_step_guarded(
                         I, gt_S, M_S, controller,
+                        beta=beta_S, use_gate=gate,
                         corr_clip=corr_clip_S,
                         tvw=0.0, max_backtracks=2, shrink=0.5, clip_decay=clip_decay
                     )
@@ -95,6 +107,7 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 else:
                     I, _ = nftm_step(
                         I, gt_S, M_S, controller,
+                        beta=beta_S, use_gate=gate,
                         corr_clip=corr_clip_S, clip_decay=clip_decay
                     )
                 # ----- NEW: accumulate per-step MSE with linear weights -----
@@ -141,6 +154,7 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
 
 @torch.no_grad()
 def eval_steps(controller, loader, device, K_eval=10,
+               beta: float | None = None, gate: bool = False,
                p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
                corr_clip=0.2, descent_guard=False, tvw=0.0,
                save_per_epoch_dir=None, epoch_tag=None, pyramid_sizes=None, 
@@ -158,6 +172,8 @@ def eval_steps(controller, loader, device, K_eval=10,
     save_seq = (save_per_epoch_dir is not None)
     if save_seq:
         ensure_dir(save_per_epoch_dir)
+
+    use_gate_flag = bool(gate)
 
     for bidx, (imgs, _) in enumerate(loader):
         imgs = imgs.to(device, non_blocking=True)
@@ -223,8 +239,6 @@ def eval_steps(controller, loader, device, K_eval=10,
         I = clamp_known(I0.clone(), imgs, M)
         total_steps = 0  # to ensure we produce exactly K_eval entries
 
-        gate_stats = []
-
         for lvl, (S, T) in enumerate(zip(sizes, steps_per)):
             gt_S = imgs if S == imgs.shape[-1] else downsample_like(imgs, S)
             M_S = M if S == imgs.shape[-1] else downsample_mask_minpool(M, S)
@@ -233,26 +247,29 @@ def eval_steps(controller, loader, device, K_eval=10,
             scale_fac = float(sizes[-1]) / float(S)
             corr_clip_S = corr_clip * scale_fac
 
+            beta_S = None if beta is None else min(float(beta) * scale_fac, 0.9)
+
             for s in range(T):
                 clip_decay = (0.92 ** s)
                 if descent_guard:
                     I, _, _, _, _ = nftm_step_guarded(
-                        I, gt_S, M_S, controller, corr_clip=corr_clip_S,
-                        tvw=tvw, max_backtracks=3, shrink=0.5, clip_decay=clip_decay
+                        I, gt_S, M_S, controller, corr_clip=corr_clip_S, beta=beta_S,
+                        tvw=tvw, max_backtracks=3, shrink=0.5, clip_decay=clip_decay,
+                        use_gate=use_gate_flag,
                     )
-                    gate = None
-                    dI = None
+                    gate_map = None
                 else:
-                    if save_seq and bidx == 0:
-                        I, _ = nftm_step(
-                            I, gt_S, M_S, controller,
-                            corr_clip=corr_clip_S, clip_decay=clip_decay
+                    if save_seq and bidx == 0 and use_gate_flag:
+                        I, _, _ = nftm_step(
+                            I, gt_S, M_S, controller, beta=beta_S, use_gate=True,
+                            corr_clip=corr_clip_S, clip_decay=clip_decay, return_gate=True
                         )
                     else:
                         I, _ = nftm_step(
-                            I, gt_S, M_S, controller,
+                            I, gt_S, M_S, controller, beta=beta_S, use_gate=use_gate_flag,
                             corr_clip=corr_clip_S, clip_decay=clip_decay
                         )
+                        gate_map = None
 
                     
                 if save_seq and bidx == 0:
@@ -319,6 +336,8 @@ def evaluate_metrics_full(
     device,
     *,
     K_eval: int,
+    beta: float | None = None,
+    gate: bool = False,
     p_missing=(0.25, 0.5),
     block_prob=0.5,
     noise_std=0.3,
@@ -364,16 +383,18 @@ def evaluate_metrics_full(
 
             scale_fac = float(sizes[-1]) / float(S)
             corr_clip_S = corr_clip * scale_fac
+            beta_S = None if beta is None else min(float(beta) * scale_fac, 0.9)
 
             for s in range(T):
                 clip_decay = 0.92 ** s
                 if descent_guard:
                     I, _, _, _, _ = nftm_step_guarded(I, gt_S, M_S, controller,
+                                                      beta=beta_S, use_gate=gate,
                                                       corr_clip=corr_clip_S,
                                                       tvw=tvw, max_backtracks=3, shrink=0.5,
                                                       clip_decay=clip_decay)
                 else:
-                    I, _ = nftm_step(I, gt_S, M_S, controller,
+                    I, _ = nftm_step(I, gt_S, M_S, controller, beta=beta_S, use_gate=gate,
                                      corr_clip=corr_clip_S, clip_decay=clip_decay)
 
             # upsample hand-off with size-matched clamp

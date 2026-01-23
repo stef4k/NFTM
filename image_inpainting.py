@@ -26,7 +26,7 @@ from nftm_inpaint.metrics import ssim as _metric_ssim
 from nftm_inpaint.metrics import (fid_init, fid_update, fid_compute,
                      kid_init, kid_update, kid_compute)
 from nftm_inpaint.unet_model import TinyUNet
-import wandb
+# import wandb
 
 # bring in our split pieces
 from nftm_inpaint.data_and_viz import set_seed, get_transform, ensure_dir, plot_metric_curve
@@ -48,6 +48,10 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--K_train", type=int, default=8, help="max rollout steps for training curriculum")
     parser.add_argument("--K_eval", type=int, default=12, help="rollout steps for evaluation")
+    parser.add_argument("--beta_start", type=float, default=None, help="(optional) initial beta (step size). If not set, beta is disabled.")
+    parser.add_argument("--beta_max", type=float, default=None, help="(optional) cap on beta during training")
+    parser.add_argument("--beta_anneal", type=float, default=None, help="(optional) per-epoch beta increment")
+    parser.add_argument("--beta_eval_bonus", type=float, default=None, help="(optional) extra beta for eval")
     parser.add_argument("--tv_weight", type=float, default=0.01)
     parser.add_argument("--corr_clip", type=float, default=0.1, help="max per-step correction magnitude (base)")
     parser.add_argument("--pmin", type=float, default=0.25, help="min missing fraction")
@@ -74,6 +78,7 @@ def main():
     parser.add_argument("--pyr_steps", type=str, default="", help="comma-separated rollout steps per level summing to K_eval (e.g., '3,9'). Empty = auto split.")
     parser.add_argument("--viz_scale", type=float, default=1.0, help="Visualization upsample scale for PNG/GIF (1.0 = native, 2.0 = 2×).")
     parser.add_argument("--step_loss", type=str, default="final", choices=["final", "linear"], help="How to accumulate data loss over rollout steps: ""'final' = only final output, 'linear' = linearly weighted per-step losses.")
+    parser.add_argument("--gate", action="store_true", help="Enable controller gate: I += beta * gate * dI (otherwise gate ignored).")
     parser.add_argument("--eval_noise_sweep", action="store_true",
                     help="Run eval over multiple corruption noise types and save per-noise visuals + metrics.")
     parser.add_argument("--gaussian_additive", action="store_true", help="Use additive Gaussian corruption inside missing region: (img + N(0,std)) instead of replacement N(0,std). WARNING: uses ground truth inside the hole (not a pure inpainting setting).")
@@ -169,12 +174,29 @@ def main():
     ssim_curve = None
     lpips_curve = None
 
+    use_beta = (args.beta_start is not None)
+
+    if use_beta:
+        beta_start = float(args.beta_start)
+        beta_anneal = float(args.beta_anneal) if args.beta_anneal is not None else 0.0
+        beta_max = float(args.beta_max) if args.beta_max is not None else beta_start
+        beta_eval_bonus = float(args.beta_eval_bonus) if args.beta_eval_bonus is not None else 0.0
+    else:
+        beta_start = beta_anneal = beta_max = beta_eval_bonus = None
+
     # Train
     for ep in range(1, args.epochs+1):
+
+        beta = None
+        beta_eval = None
+        if use_beta:
+            beta = min(beta_start + beta_anneal * (ep - 1), beta_max)
+            beta_eval = min(beta + beta_eval_bonus, 0.9)
+
         train_loss, train_psnr, stats = train_epoch(
             controller, opt, train_loader, device, epoch=ep,
-            K_target=args.K_train, K_base=4, tvw=args.tv_weight,
-            p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
+            K_target=args.K_train, K_base=4, beta=beta, gate=args.gate, beta_max=beta_max, 
+            tvw=args.tv_weight, p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
             noise_std=args.noise_std, corr_clip=args.corr_clip,
             guard_in_train=args.guard_in_train,
             contract_w=args.contract_w, rollout_bias=True,
@@ -186,7 +208,7 @@ def main():
 
         curves = eval_steps(
             controller, test_loader, device,
-            K_eval=args.K_eval,
+            K_eval=args.K_eval, beta=beta_eval, gate=args.gate,
             p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
             noise_std=args.noise_std, corr_clip=args.corr_clip,
             descent_guard=False, tvw=0.0,
@@ -207,7 +229,8 @@ def main():
         else:
             curve_str = "n/a"
             tail_val = "n/a"
-        msg = (f"[ep {ep:02d}] K_train={stats['train_K']} | loss {train_loss:.4f} | "
+        beta_str = f"{beta:.3f}" if beta is not None else "off"
+        msg = (f"[ep {ep:02d}] β_train={beta_str} | K_train={stats['train_K']} | loss {train_loss:.4f} | "
                f"train PSNR {train_psnr:.2f} dB | eval PSNR 1..{args.K_eval}: {curve_str} ... {tail_val} | "
                f"ctrl={args.controller}")
         if ssim_curve.size > 0 and lpips_curve.size > 0:
@@ -228,6 +251,7 @@ def main():
                 "train/psnr": train_psnr,
                 "eval/psnr_final": float(psnr_curve[-1]) if psnr_curve.size > 0 else None,
                 "eval/ssim_final": float(ssim_curve[-1]) if ssim_curve.size > 0 else None,
+                "eval/lpips_final": float(lpips_curve[-1]) if lpips_curve.size > 0 else None,
                 "K_train": stats["train_K"],
                 "controller": args.controller,
             })
@@ -242,10 +266,15 @@ def main():
     if lpips_curve is not None and lpips_curve.size > 0:
         plot_metric_curve(lpips_curve, os.path.join(args.save_dir, "lpips_curve.png"),
                           "LPIPS", "Step-wise LPIPS (eval)")
+        
+    beta_eval_final = None
+    if use_beta:
+        beta_final = min(beta_start + beta_anneal * (args.epochs - 1), beta_max)
+        beta_eval_final = min(beta_final + beta_eval_bonus, 0.9)
 
     _ = eval_steps(
         controller, test_loader, device,
-        K_eval=args.K_eval,
+        K_eval=args.K_eval, beta=beta_eval_final, gate=args.gate,
         p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
         noise_std=args.noise_std, corr_clip=args.corr_clip,
         descent_guard=False, tvw=0.0,
@@ -264,6 +293,8 @@ def main():
             test_loader,
             device,
             K_eval=args.K_eval,
+            beta=beta_eval_final,
+            gate=args.gate,
             p_missing=(args.pmin, args.pmax),
             block_prob=args.block_prob,
             noise_std=args.noise_std,
@@ -285,6 +316,10 @@ def main():
             epochs=args.epochs,
             K_train=args.K_train,
             K_eval=args.K_eval,
+            beta_start=args.beta_start,
+            beta_max=args.beta_max,
+            beta_anneal=args.beta_anneal,
+            beta_eval_bonus=args.beta_eval_bonus,
             corr_clip=args.corr_clip,
             tv_weight=args.tv_weight,
             pmin=args.pmin, pmax=args.pmax, block_prob=args.block_prob,
@@ -346,7 +381,7 @@ def main():
             # Save progression grid/GIF for first batch
             _ = eval_steps(
                 controller, test_loader, device,
-                K_eval=args.K_eval, beta=beta_eval_sweep,
+                K_eval=args.K_eval, beta=beta_eval_sweep, gate=args.gate,
                 p_missing=(args.pmin, args.pmax), block_prob=args.block_prob,
                 noise_std=noise_std_use, corr_clip=args.corr_clip,
                 descent_guard=False, tvw=0.0,
@@ -365,6 +400,7 @@ def main():
                 device,
                 K_eval=args.K_eval,
                 beta=beta_eval_sweep,
+                gate=args.gate,
                 p_missing=(args.pmin, args.pmax),
                 block_prob=args.block_prob,
                 noise_std=noise_std_use,
