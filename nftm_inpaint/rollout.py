@@ -146,38 +146,50 @@ def energy(I, I_gt, tvw=0.01):
     data_term = F.mse_loss(I, I_gt)
     return data_term + tv_l1(I, tvw)
 
-def nftm_step(I, I_gt, M, controller, beta=0.5, corr_clip=0.2, clip_decay=1.0, return_gate=False):
+def nftm_step(I, I_gt, M, controller, beta: float | None = None, corr_clip=0.2, 
+              clip_decay=1.0, use_gate: bool = False, return_gate=False):
     """One step without guard; returns (I_new, logS)."""
-    dI, _gate, logS = controller(I, M)
+    dI, gate, logS = controller(I, M)
     dI = dI.clamp(-corr_clip * clip_decay, corr_clip * clip_decay)
 
-    I_prop = I + dI
+    b = 1.0 if beta is None else float(beta)
+
+    if use_gate:
+        # safety clamp; if your controller already outputs sigmoid, this is a no-op
+        gate_use = gate.clamp(0.0, 1.0)
+        I_prop = I + b * gate_use * dI
+    else:
+        I_prop = I + b * dI
     I_new = clamp_known(I_prop, I_gt, M)
+    
+    if return_gate:
+        return I_new, logS, gate
     return I_new, logS
 
-def nftm_step_guarded(I, I_gt, M, controller, corr_clip=0.2, tvw=0.01,
-                      max_backtracks=3, shrink=0.5, clip_decay=1.0):
+def nftm_step_guarded(I, I_gt, M, controller, corr_clip=0.2, tvw=0.01, beta: float | None = None,
+                      max_backtracks=3, shrink=0.5, clip_decay=1.0, use_gate: bool = False):
     with torch.no_grad():
         E0 = energy(I, I_gt, tvw=tvw)
 
-    cur_clip = corr_clip
-    last_I_prop, last_logS, last_clip = I, None, cur_clip
+    cur_beta = 1.0 if beta is None else float(beta)
+    last_I_prop, last_logS, last_beta = I, None, cur_beta
     last_dE = 0.0
 
     for _ in range(max_backtracks + 1):
-        I_prop, logS = nftm_step(I, I_gt, M, controller, corr_clip=cur_clip, clip_decay=clip_decay)
+        I_prop, logS = nftm_step(I, I_gt, M, controller, beta=cur_beta, corr_clip=corr_clip, 
+                                 clip_decay=clip_decay, use_gate=use_gate)
 
         with torch.no_grad():
             E1 = energy(I_prop, I_gt, tvw=tvw)
 
         if E1 <= E0:
-            return I_prop, logS, cur_clip, True, float(E1 - E0)
+            return I_prop, logS, cur_beta, True, float(E1 - E0)
 
-        last_I_prop, last_logS, last_clip = I_prop, logS, cur_clip
+        last_I_prop, last_logS, last_beta = I_prop, logS, cur_beta
         last_dE = float(E1 - E0)
-        cur_clip *= shrink
+        cur_beta *= shrink
 
-    return last_I_prop, last_logS, last_clip, False, last_dE
+    return last_I_prop, last_logS, last_beta, False, last_dE
 
 def count_params(m):
     return sum(p.numel() for p in m.parameters() if p.requires_grad)
