@@ -56,6 +56,20 @@ benchmarks_dir = os.path.join(root_dir, "benchmarks")
 
 # -------------------------- SIDD utilities --------------------------
 
+def _sidd_scene_group(scene_name: str) -> str:
+    """
+    Group scenes by the SIDD naming convention:
+      <scene-instance-number>_<scene_number>_<smartphone-code>_...
+    We use the second token (scene_number) to prevent leakage.
+    """
+    parts = scene_name.split("_")
+    if len(parts) >= 2 and parts[1]:
+        scene_num = parts[1]
+        if scene_num.isdigit():
+            return f"scene_{int(scene_num)}"
+        return f"scene_{scene_num}"
+    return scene_name
+
 def _sidd_collect_pairs(scene_dir: Path):
     noisy = sorted(scene_dir.glob("*_NOISY_SRGB_*.PNG"))
     pairs = []
@@ -80,24 +94,47 @@ def _sidd_make_or_load_index(sidd_root: str, index_dir: str, train_frac: float, 
 
     # reuse (important on cluster)
     if train_path.exists() and test_path.exists() and meta_path.exists():
-        print(f"[SIDD] Reusing existing index in: {index_dir}")
-        return str(train_path), str(test_path)
+        reuse = False
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            reuse = (meta.get("scene_grouping") == "scene_number")
+        except Exception:
+            reuse = False
+        if reuse:
+            print(f"[SIDD] Reusing existing index in: {index_dir}")
+            return str(train_path), str(test_path)
+        print("[SIDD] Existing index missing scene_grouping=scene_number; rebuilding to avoid leakage.")
 
     scenes = sorted([p for p in data_dir.iterdir() if p.is_dir()])
     if not scenes:
         raise RuntimeError("[SIDD] No scene folders found under Data/")
 
+    grouped = {}
+    for scene in scenes:
+        key = _sidd_scene_group(scene.name)
+        grouped.setdefault(key, []).append(scene)
+
+    groups = list(grouped.items())
     rng = random.Random(seed)
-    rng.shuffle(scenes)
-    n_train = int(len(scenes) * float(train_frac))
-    train_scenes = scenes[:n_train]
-    test_scenes  = scenes[n_train:]
+    rng.shuffle(groups)
+    n_train = int(len(groups) * float(train_frac))
+    train_groups = groups[:n_train]
+    test_groups  = groups[n_train:]
+
+    train_scenes = [s for _, lst in train_groups for s in lst]
+    test_scenes  = [s for _, lst in test_groups for s in lst]
 
     def build_rows(scene_list):
         rows = []
         for scene in scene_list:
+            scene_group = _sidd_scene_group(scene.name)
             for noisy, gt in _sidd_collect_pairs(scene):
-                rows.append({"scene": scene.name, "noisy": noisy, "gt": gt})
+                rows.append({
+                    "scene": scene.name,
+                    "scene_group": scene_group,
+                    "noisy": noisy,
+                    "gt": gt,
+                })
         return rows
 
     train_rows = build_rows(train_scenes)
@@ -106,12 +143,16 @@ def _sidd_make_or_load_index(sidd_root: str, index_dir: str, train_frac: float, 
     meta = dict(
         sidd_root=str(sidd_root),
         num_scenes=len(scenes),
+        num_scene_groups=len(groups),
         train_scenes=len(train_scenes),
         test_scenes=len(test_scenes),
+        train_scene_groups=len(train_groups),
+        test_scene_groups=len(test_groups),
         train_pairs=len(train_rows),
         test_pairs=len(test_rows),
         seed=int(seed),
         train_frac=float(train_frac),
+        scene_grouping="scene_number",
     )
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     train_path.write_text("\n".join(json.dumps(r) for r in train_rows) + "\n", encoding="utf-8")
@@ -255,6 +296,179 @@ class SIDDIndexTiles(torch.utils.data.Dataset):
         noisy = self.norm(self.to_tensor(noisy))
         gt = self.norm(self.to_tensor(gt))
         return noisy, gt
+
+
+def _sidd_tile_positions(size: int, patch: int, stride: int):
+    if size <= patch:
+        return [0]
+    positions = list(range(0, size - patch + 1, stride))
+    last = size - patch
+    if positions[-1] != last:
+        positions.append(last)
+    return positions
+
+
+@torch.no_grad()
+def _sidd_reconstruct_full_image(
+    controller,
+    noisy_full: torch.Tensor,
+    gt_full: torch.Tensor,
+    device,
+    patch: int,
+    stride: int,
+    K_eval: int,
+    beta: float,
+    gate: bool,
+    corr_clip: float,
+    batch_size: int,
+):
+    controller.eval()
+    _, H, W = noisy_full.shape
+
+    xs = _sidd_tile_positions(W, patch, stride)
+    ys = _sidd_tile_positions(H, patch, stride)
+
+    accum = torch.zeros((3, H, W), dtype=torch.float32)
+    weight = torch.zeros((1, H, W), dtype=torch.float32)
+
+    coords = [(x, y) for y in ys for x in xs]
+    if batch_size <= 0:
+        batch_size = len(coords)
+
+    for start in range(0, len(coords), batch_size):
+        batch_coords = coords[start:start + batch_size]
+        tiles_noisy = torch.stack(
+            [noisy_full[:, y:y + patch, x:x + patch] for (x, y) in batch_coords],
+            dim=0
+        )
+        tiles_gt = torch.stack(
+            [gt_full[:, y:y + patch, x:x + patch] for (x, y) in batch_coords],
+            dim=0
+        )
+        tiles_noisy = tiles_noisy.to(device, non_blocking=True)
+        tiles_gt = tiles_gt.to(device, non_blocking=True)
+
+        M = torch.zeros((tiles_noisy.size(0), 1, patch, patch),
+                        device=device, dtype=tiles_noisy.dtype)
+
+        I = tiles_noisy
+        for s in range(int(K_eval)):
+            I, _ = nftm_step(
+                I, tiles_gt, M, controller,
+                beta=min(float(beta), 0.9),
+                use_gate=gate,
+                corr_clip=corr_clip,
+                clip_decay=(0.92 ** s)
+            )
+
+        preds = I.clamp(-1, 1).cpu()
+        for idx, (x, y) in enumerate(batch_coords):
+            accum[:, y:y + patch, x:x + patch] += preds[idx]
+            weight[:, y:y + patch, x:x + patch] += 1.0
+
+    return accum / weight.clamp_min(1e-6)
+
+
+@torch.no_grad()
+def save_sidd_full_images(
+    controller,
+    index_jsonl: str,
+    device,
+    patch: int,
+    stride: int,
+    K_eval: int,
+    beta: float,
+    gate: bool,
+    corr_clip: float,
+    out_dir: str,
+    max_images: int = 0,
+    batch_size: int = 0,
+):
+    rows = _read_jsonl(index_jsonl)
+    if not rows:
+        raise RuntimeError(f"[SIDD] Empty index file: {index_jsonl}")
+
+    seen = set()
+    images = []
+    for r in rows:
+        key = (r["noisy"], r["gt"])
+        if key in seen:
+            continue
+        seen.add(key)
+        images.append(r)
+
+    if max_images and max_images > 0:
+        images = images[:max_images]
+
+    ensure_dir(out_dir)
+    per_image = []
+
+    to_tensor = T.ToTensor()
+
+    for idx, r in enumerate(images):
+        noisy_path = r["noisy"]
+        gt_path = r["gt"]
+        scene = r.get("scene", Path(noisy_path).parent.name)
+
+        with Image.open(noisy_path) as imn:
+            imn = imn.convert("RGB")
+            noisy_t = to_tensor(imn)
+
+        with Image.open(gt_path) as img:
+            img = img.convert("RGB")
+            gt_t = to_tensor(img)
+
+        noisy_norm = (noisy_t - 0.5) / 0.5
+        gt_norm = (gt_t - 0.5) / 0.5
+
+        pred_norm = _sidd_reconstruct_full_image(
+            controller=controller,
+            noisy_full=noisy_norm,
+            gt_full=gt_norm,
+            device=device,
+            patch=int(patch),
+            stride=int(stride),
+            K_eval=int(K_eval),
+            beta=float(beta),
+            gate=bool(gate),
+            corr_clip=float(corr_clip),
+            batch_size=int(batch_size),
+        )
+
+        pred_b = pred_norm.unsqueeze(0)
+        gt_b = gt_norm.unsqueeze(0)
+        psnr_val = float(_metric_psnr(pred_b, gt_b).item())
+        ssim_val = float(_metric_ssim(pred_b, gt_b).item())
+
+        stem = Path(noisy_path).stem
+        base = f"{idx:04d}_{scene}_{stem}"
+
+        Image.fromarray(_to_uint8_img(noisy_norm)).save(os.path.join(out_dir, f"{base}_noisy.png"))
+        Image.fromarray(_to_uint8_img(pred_norm)).save(os.path.join(out_dir, f"{base}_pred.png"))
+        Image.fromarray(_to_uint8_img(gt_norm)).save(os.path.join(out_dir, f"{base}_gt.png"))
+
+        per_image.append({
+            "scene": scene,
+            "noisy": noisy_path,
+            "gt": gt_path,
+            "psnr": psnr_val,
+            "ssim": ssim_val,
+            "file_base": base,
+        })
+
+        print(f"[SIDD] full {idx+1}/{len(images)} | PSNR {psnr_val:.2f} | SSIM {ssim_val:.4f}")
+
+    summary = {
+        "num_images": len(per_image),
+        "mean_psnr": float(np.mean([m["psnr"] for m in per_image])) if per_image else None,
+        "mean_ssim": float(np.mean([m["ssim"] for m in per_image])) if per_image else None,
+        "per_image": per_image,
+    }
+    with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[SIDD] full-image outputs saved to: {out_dir}")
+    return summary
 
 # -------------------------- SIDD denoising loops --------------------------
 
@@ -589,6 +803,14 @@ def main():
     parser.add_argument("--sidd_viz_max_steps", type=int, default=24,
                         help="Max number of step-columns to show. If K_eval <= this, show all steps; else show evenly spaced steps.")
 
+    # NEW: SIDD full-image reconstruction
+    parser.add_argument("--sidd_save_full_images", action="store_true",
+                        help="Reconstruct and save full SIDD test images by stitching denoised tiles.")
+    parser.add_argument("--sidd_full_max_images", type=int, default=0,
+                        help="Max number of full test images to reconstruct (0 = all).")
+    parser.add_argument("--sidd_full_batch", type=int, default=0,
+                        help="Batch size for full-image tile inference (0 = use --batch_size).")
+
     # eval cadence
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--eval_max_batches", type=int, default=50)
@@ -641,6 +863,7 @@ def main():
         img_size = int(args.patch_size)
 
     # datasets
+    sidd_test_jsonl = None
     if is_sidd:
         train_jsonl, test_jsonl = _sidd_make_or_load_index(
             sidd_root=args.sidd_root,
@@ -648,6 +871,7 @@ def main():
             train_frac=args.sidd_train_frac,
             seed=args.seed,
         )
+        sidd_test_jsonl = test_jsonl
         limit = None if args.sidd_limit_tiles <= 0 else int(args.sidd_limit_tiles)
         train_set = SIDDIndexTiles(train_jsonl, patch=img_size, stride=int(args.patch_stride), limit_tiles=limit)
         test_set  = SIDDIndexTiles(test_jsonl,  patch=img_size, stride=int(args.patch_stride), limit_tiles=limit)
@@ -982,6 +1206,29 @@ def main():
             json.dump(summary, f, indent=2)
 
         print(f"[metrics] saved {os.path.join(args.save_dir, 'metrics.json')}")
+
+    # ------------------------- SIDD full-image reconstruction -------------------------
+    if is_sidd and args.sidd_save_full_images:
+        if not sidd_test_jsonl:
+            raise RuntimeError("[SIDD] Missing test index for full-image reconstruction.")
+        full_dir = os.path.join(args.save_dir, "sidd_full")
+        ensure_dir(full_dir)
+        beta_full = beta_eval_final if beta_eval_final is not None else 0.6
+        batch_full = int(args.sidd_full_batch) if args.sidd_full_batch > 0 else int(args.batch_size)
+        save_sidd_full_images(
+            controller=controller,
+            index_jsonl=sidd_test_jsonl,
+            device=device,
+            patch=int(args.patch_size),
+            stride=int(args.patch_stride),
+            K_eval=int(args.K_eval),
+            beta=float(beta_full),
+            gate=bool(args.gate),
+            corr_clip=float(args.corr_clip),
+            out_dir=full_dir,
+            max_images=int(args.sidd_full_max_images),
+            batch_size=batch_full,
+        )
 
     # ------------------------- synthetic noise sweep (NOT for SIDD) -------------------------
     if args.eval_noise_sweep:

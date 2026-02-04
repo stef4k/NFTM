@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=sidd_test3
+#SBATCH --job-name=sidd_test5
 #SBATCH --partition=gpua100
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
@@ -32,7 +32,7 @@ conda activate nftm
   --train_dataset sidd --benchmark sidd \
   --sidd_root /gpfs/workdir/balazsk/NFTM/benchmarks/SIDD/SIDD_Medium_Srgb \
   --patch_size 64 --patch_stride 64 \
-  --epochs 1 \
+  --epochs 2 \
   --batch_size 64 \
   --K_train 8 --K_eval 12 \
   --beta_start 0.35 --beta_max 0.85 --beta_eval_bonus 0.10 \
@@ -43,6 +43,9 @@ conda activate nftm
   --save_epoch_progress \
   --sidd_viz_samples 100 --sidd_viz_pngs 10 \
   --sidd_viz_max_steps 24 \
-  --sidd_limit_tiles 150 \
-  --save_dir out/sidd_denoise_check3 \
+  --sidd_limit_tiles 300 \
+  --save_dir out/sidd_denoise_check5 \
   --save_epoch_progress \
+  --sidd_save_full_images \
+  --sidd_full_max_images 30 \
+  --sidd_full_batch 32
