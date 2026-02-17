@@ -12,7 +12,7 @@
 # - Optional metrics.json saving
 # - Optional noise sweep for synthetic corruptions (NOT for SIDD)
 
-import os, random, argparse, json, numpy as np
+import os, random, argparse, json, time, numpy as np
 from pathlib import Path
 from PIL import Image
 import torch
@@ -298,6 +298,34 @@ class SIDDIndexTiles(torch.utils.data.Dataset):
         return noisy, gt
 
 
+class SIDDPerEpochSubsetSampler(torch.utils.data.Sampler):
+    """
+    Draw a fresh random subset of tile indices each epoch.
+    """
+    def __init__(self, dataset_size: int, samples_per_epoch: int, seed: int = 0):
+        self.dataset_size = int(dataset_size)
+        self.samples_per_epoch = int(samples_per_epoch)
+        self.seed = int(seed)
+        self.epoch = 0
+        if self.dataset_size <= 0:
+            raise ValueError("dataset_size must be > 0")
+        if self.samples_per_epoch <= 0:
+            raise ValueError("samples_per_epoch must be > 0")
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return min(self.samples_per_epoch, self.dataset_size)
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        n = min(self.samples_per_epoch, self.dataset_size)
+        perm = torch.randperm(self.dataset_size, generator=g).tolist()
+        return iter(perm[:n])
+
+
 def _sidd_tile_positions(size: int, patch: int, stride: int):
     if size <= patch:
         return [0]
@@ -306,6 +334,26 @@ def _sidd_tile_positions(size: int, patch: int, stride: int):
     if positions[-1] != last:
         positions.append(last)
     return positions
+
+
+def _sidd_blend_window(size: int, border: int) -> torch.Tensor:
+    """
+    2D separable blending window in [0,1], shape (1, size, size).
+    """
+    border = int(max(0, border))
+    if border <= 0:
+        return torch.ones((1, size, size), dtype=torch.float32)
+
+    border = min(border, size // 2)
+    if border <= 0:
+        return torch.ones((1, size, size), dtype=torch.float32)
+
+    axis = torch.ones(size, dtype=torch.float32)
+    ramp = torch.linspace(0.0, 1.0, steps=border + 2, dtype=torch.float32)[1:-1]
+    axis[:border] = ramp
+    axis[-border:] = torch.flip(ramp, dims=[0])
+    win = axis[:, None] * axis[None, :]
+    return win.unsqueeze(0)
 
 
 @torch.no_grad()
@@ -321,12 +369,25 @@ def _sidd_reconstruct_full_image(
     gate: bool,
     corr_clip: float,
     batch_size: int,
+    tile_pad: int = 0,
 ):
     controller.eval()
     _, H, W = noisy_full.shape
 
+    tile_pad = int(max(0, tile_pad))
     xs = _sidd_tile_positions(W, patch, stride)
     ys = _sidd_tile_positions(H, patch, stride)
+
+    if tile_pad > 0:
+        pad_mode = "reflect" if (H > tile_pad and W > tile_pad) else "replicate"
+        noisy_src = F.pad(noisy_full.unsqueeze(0), (tile_pad, tile_pad, tile_pad, tile_pad), mode=pad_mode).squeeze(0)
+        gt_src = F.pad(gt_full.unsqueeze(0), (tile_pad, tile_pad, tile_pad, tile_pad), mode=pad_mode).squeeze(0)
+    else:
+        noisy_src = noisy_full
+        gt_src = gt_full
+
+    patch_in = patch + 2 * tile_pad
+    blend_win = _sidd_blend_window(patch, border=tile_pad)
 
     accum = torch.zeros((3, H, W), dtype=torch.float32)
     weight = torch.zeros((1, H, W), dtype=torch.float32)
@@ -338,17 +399,17 @@ def _sidd_reconstruct_full_image(
     for start in range(0, len(coords), batch_size):
         batch_coords = coords[start:start + batch_size]
         tiles_noisy = torch.stack(
-            [noisy_full[:, y:y + patch, x:x + patch] for (x, y) in batch_coords],
+            [noisy_src[:, y:y + patch_in, x:x + patch_in] for (x, y) in batch_coords],
             dim=0
         )
         tiles_gt = torch.stack(
-            [gt_full[:, y:y + patch, x:x + patch] for (x, y) in batch_coords],
+            [gt_src[:, y:y + patch_in, x:x + patch_in] for (x, y) in batch_coords],
             dim=0
         )
         tiles_noisy = tiles_noisy.to(device, non_blocking=True)
         tiles_gt = tiles_gt.to(device, non_blocking=True)
 
-        M = torch.zeros((tiles_noisy.size(0), 1, patch, patch),
+        M = torch.zeros((tiles_noisy.size(0), 1, patch_in, patch_in),
                         device=device, dtype=tiles_noisy.dtype)
 
         I = tiles_noisy
@@ -362,9 +423,11 @@ def _sidd_reconstruct_full_image(
             )
 
         preds = I.clamp(-1, 1).cpu()
+        if tile_pad > 0:
+            preds = preds[:, :, tile_pad:tile_pad + patch, tile_pad:tile_pad + patch]
         for idx, (x, y) in enumerate(batch_coords):
-            accum[:, y:y + patch, x:x + patch] += preds[idx]
-            weight[:, y:y + patch, x:x + patch] += 1.0
+            accum[:, y:y + patch, x:x + patch] += preds[idx] * blend_win
+            weight[:, y:y + patch, x:x + patch] += blend_win
 
     return accum / weight.clamp_min(1e-6)
 
@@ -383,6 +446,7 @@ def save_sidd_full_images(
     out_dir: str,
     max_images: int = 0,
     batch_size: int = 0,
+    tile_pad: int = 0,
 ):
     rows = _read_jsonl(index_jsonl)
     if not rows:
@@ -433,6 +497,7 @@ def save_sidd_full_images(
             gate=bool(gate),
             corr_clip=float(corr_clip),
             batch_size=int(batch_size),
+            tile_pad=int(tile_pad),
         )
 
         pred_b = pred_norm.unsqueeze(0)
@@ -794,6 +859,8 @@ def main():
     parser.add_argument("--patch_stride", type=int, default=64)
     parser.add_argument("--sidd_limit_tiles", type=int, default=0,
                         help="Debug limit for tiles. 0 = no limit.")
+    parser.add_argument("--sidd_epoch_tiles", type=int, default=0,
+                        help="Randomly sample this many SIDD train tiles per epoch (0 = use all available tiles).")
 
     # NEW: SIDD visualization controls (only affects saved PNG grids)
     parser.add_argument("--sidd_viz_samples", type=int, default=50,
@@ -810,6 +877,8 @@ def main():
                         help="Max number of full test images to reconstruct (0 = all).")
     parser.add_argument("--sidd_full_batch", type=int, default=0,
                         help="Batch size for full-image tile inference (0 = use --batch_size).")
+    parser.add_argument("--sidd_full_tile_pad", type=int, default=0,
+                        help="Extra reflected context around each full-image tile before denoising (pixels).")
 
     # eval cadence
     parser.add_argument("--eval_every", type=int, default=5)
@@ -933,7 +1002,19 @@ def main():
     else:
         loader_kwargs.update(dict(num_workers=0))
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
+    train_sampler = None
+    if is_sidd and int(args.sidd_epoch_tiles) > 0:
+        train_sampler = SIDDPerEpochSubsetSampler(
+            dataset_size=len(train_set),
+            samples_per_epoch=int(args.sidd_epoch_tiles),
+            seed=int(args.seed) + 1337,
+        )
+        print(f"[SIDD] per-epoch train subset: {len(train_sampler)}/{len(train_set)} tiles (reshuffled each epoch)")
+
+    if train_sampler is not None:
+        train_loader = DataLoader(train_set, batch_size=args.batch_size, sampler=train_sampler, shuffle=False, **loader_kwargs)
+    else:
+        train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
     test_loader  = DataLoader(test_set,  batch_size=args.batch_size, shuffle=False, **loader_kwargs)
 
     # model
@@ -992,7 +1073,12 @@ def main():
     psnr_curve = ssim_curve = lpips_curve = None
 
     # ------------------------- training loop -------------------------
+    train_loop_t0 = time.time()
     for ep in range(1, args.epochs + 1):
+        ep_t0 = time.time()
+        if train_sampler is not None:
+            train_sampler.set_epoch(ep)
+
         beta = None
         beta_eval = None
         if use_beta:
@@ -1097,6 +1183,7 @@ def main():
         )
         if ssim_curve.size > 0 and lpips_curve.size > 0:
             line += f" | final SSIM {ssim_curve[-1]:.4f} | final LPIPS {lpips_curve[-1]:.4f}"
+        line += f" | ep_time {time.time() - ep_t0:.1f}s"
 
         print(line)
         log_f.write(line + "\n")
@@ -1117,6 +1204,11 @@ def main():
                 "K_train": stats["train_K"],
                 "controller": args.controller,
             })
+
+    train_total_s = time.time() - train_loop_t0
+    train_time_line = f"[timing] training loop wall-clock: {train_total_s:.1f}s"
+    print(train_time_line)
+    log_f.write(train_time_line + "\n")
 
     # save curves plots
     if psnr_curve is not None and psnr_curve.size > 0:
@@ -1228,6 +1320,7 @@ def main():
             out_dir=full_dir,
             max_images=int(args.sidd_full_max_images),
             batch_size=batch_full,
+            tile_pad=int(args.sidd_full_tile_pad),
         )
 
     # ------------------------- synthetic noise sweep (NOT for SIDD) -------------------------
