@@ -26,11 +26,11 @@ from nftm_inpaint.metrics import ssim as _metric_ssim
 from nftm_inpaint.metrics import (fid_init, fid_update, fid_compute,
                      kid_init, kid_update, kid_compute)
 from nftm_inpaint.unet_model import TinyUNet
-# import wandb
+import wandb
 
 # bring in our split pieces
-from nftm_inpaint.data_and_viz import set_seed, get_transform, ensure_dir, plot_metric_curve
-from nftm_inpaint.rollout import parse_pyramid_arg, split_steps_eval, count_params
+from nftm_inpaint.data_and_viz import set_seed, get_transform, ensure_dir, plot_metric_curve, random_mask
+from nftm_inpaint.rollout import parse_pyramid_arg, split_steps_eval, count_params, estimate_sigma_max_update, corrupt_images, clamp_known
 from nftm_inpaint.controller import TinyController, UNetController
 from nftm_inpaint.engine import train_epoch, eval_steps, evaluate_metrics_full
 
@@ -53,7 +53,7 @@ def main():
     parser.add_argument("--beta_anneal", type=float, default=None, help="(optional) per-epoch beta increment")
     parser.add_argument("--beta_eval_bonus", type=float, default=None, help="(optional) extra beta for eval")
     parser.add_argument("--tv_weight", type=float, default=0.01)
-    parser.add_argument("--corr_clip", type=float, default=0.1, help="max per-step correction magnitude (base)")
+    parser.add_argument("--corr_clip", type=float, default=0.1, help="max per-step correction magnitude (base), setting it to 0 will disable it")
     parser.add_argument("--pmin", type=float, default=0.25, help="min missing fraction")
     parser.add_argument("--pmax", type=float, default=0.5, help="max missing fraction")
     parser.add_argument("--block_prob", type=float, default=0.5, help="probability to add random occlusion blocks")
@@ -70,7 +70,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--benchmark", type=str, default="cifar", choices=["cifar", "set12", "cbsd68", "celebahq"],help="choose test dataset for benchmarking")
     parser.add_argument("--train_dataset", type=str, default="cifar", choices=["cifar", "celebahq"], help="Dataset for training")
-    parser.add_argument("--img_size", type=int, default=32, choices=[32, 64, 128], help="Input image size (resize if necessary)")
+    parser.add_argument("--img_size", type=int, default=32, choices=[32, 64, 128, 256], help="Input image size (resize if necessary)")
 
     parser.add_argument("--save_metrics", action="store_true", help="save metrics.json + psnr_curve.npy to save_dir")
     parser.add_argument("--use_wandb", action="store_true", help="enable logging to Weights & Biases (wandb)")
@@ -79,9 +79,14 @@ def main():
     parser.add_argument("--viz_scale", type=float, default=1.0, help="Visualization upsample scale for PNG/GIF (1.0 = native, 2.0 = 2×).")
     parser.add_argument("--step_loss", type=str, default="final", choices=["final", "linear"], help="How to accumulate data loss over rollout steps: ""'final' = only final output, 'linear' = linearly weighted per-step losses.")
     parser.add_argument("--gate", action="store_true", help="Enable controller gate: I += beta * gate * dI (otherwise gate ignored).")
-    parser.add_argument("--eval_noise_sweep", action="store_true",
-                    help="Run eval over multiple corruption noise types and save per-noise visuals + metrics.")
+    parser.add_argument("--eval_noise_sweep", action="store_true", help="Run eval over multiple corruption noise types and save per-noise visuals + metrics.")
     parser.add_argument("--gaussian_additive", action="store_true", help="Use additive Gaussian corruption inside missing region: (img + N(0,std)) instead of replacement N(0,std). WARNING: uses ground truth inside the hole (not a pure inpainting setting).")
+    parser.add_argument("--fixed_K", action="store_true", help="Use fixed rollout length per batch: K_curr = K_train (disables random K_curr sampling).")
+    parser.add_argument("--no_curriculum", action="store_true", help="Disable K_train curriculum; use K_train = K_target from epoch 1.")
+    parser.add_argument("--log_jacobian", action="store_true", help="Estimate and log sigma_max(J) of the update map each epoch (slow-ish).")
+    parser.add_argument("--jacobian_power_iters", type=int, default=6, help="Power iterations for sigma_max estimate (higher = more accurate, slower).")
+    parser.add_argument("--jacobian_K", type=int, default=1, help="K-step map for Jacobian logging: 1=single step, >1=K-step rollout map (slower).")
+    parser.add_argument("--jacobian_batches", type=int, default=1, help="How many batches to average for jacobian logging (keep small).")
 
     args = parser.parse_args()
 
@@ -203,7 +208,8 @@ def main():
             pyramid_sizes=pyr_sizes,
             step_loss_mode=args.step_loss,
             gaussian_additive=args.gaussian_additive,
-
+            fixed_K=args.fixed_K,
+            use_curriculum=(not args.no_curriculum)
         )
 
         curves = eval_steps(
@@ -221,6 +227,46 @@ def main():
         psnr_curve = curves["psnr"]
         ssim_curve = curves["ssim"]
         lpips_curve = curves["lpips"]
+
+        if args.log_jacobian:
+            # deterministic
+            torch.manual_seed(42)
+            random.seed(42)
+            # fixed batch (like your eval seed idea)
+            controller.eval()
+            jac_vals = []
+
+            # tiny iterator each epoch (don’t reuse global iterator)
+            it = iter(test_loader)
+            for _ in range(int(args.jacobian_batches)):
+                imgs, _ = next(it)
+                imgs = imgs.to(device, non_blocking=True)
+
+                # keep this small or it will be very slow
+                imgs = imgs[:min(4, imgs.size(0))]
+
+                # same kind of corruption we're training/eval’ing on
+                Mj = random_mask(imgs, p_missing=(args.pmin, args.pmax), block_prob=args.block_prob).to(device)
+                I0j = corrupt_images(imgs, Mj, noise_std=args.noise_std, gaussian_additive=args.gaussian_additive)
+                Ij = clamp_known(I0j.clone(), imgs, Mj)
+
+                # estimate sigma_max of the update map (1 step or K steps)
+                sigma = estimate_sigma_max_update(
+                    controller,
+                    Ij, imgs, Mj,
+                    K=int(args.jacobian_K),
+                    corr_clip=float(args.corr_clip),
+                    beta=beta_eval, # or beta (if prefer train beta)
+                    clip_decay=1.0,
+                    use_gate=bool(args.gate),
+                    power_iters=int(args.jacobian_power_iters),
+                )
+                jac_vals.append(sigma)
+
+            sigma_mean = float(np.mean(jac_vals))
+            msg2 = f"         jacobian σ_max(K={args.jacobian_K}) ≈ {sigma_mean:.3f}"
+            print(msg2)
+            log_f.write(msg2 + "\n")
 
         if psnr_curve.size > 0:
             head = psnr_curve[:min(5, len(psnr_curve))]

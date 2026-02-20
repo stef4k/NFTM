@@ -31,14 +31,17 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 beta: float | None = None, beta_max: float | None = None, gate: bool = False,
                 tvw=0.01, p_missing=(0.25,0.5), block_prob=0.5, noise_std=0.3,
                 corr_clip=0.2, guard_in_train=True, contract_w=1e-3, rollout_bias=True, pyramid_sizes=None,
-                step_loss_mode: str = "final",  gaussian_additive: bool = False):
+                step_loss_mode: str = "final",  gaussian_additive: bool = False,
+                fixed_K: bool = False, use_curriculum: bool = True):
     controller.train()
     psnrs, losses = [], []
     accepted_steps, backtracks = 0, 0
 
-    # curriculum on rollout depth: grow K_train with epochs
-    # K_train = min(K_target, K_base + epoch)
-    K_train = K_target
+    if use_curriculum:
+        K_train = min(K_target, K_base + epoch)
+    else:
+        K_train = K_target
+
     sizes_default = pyramid_sizes if pyramid_sizes else None
 
     for imgs, _ in loader:
@@ -47,16 +50,17 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
         I0 = corrupt_images(imgs, M, noise_std=noise_std, gaussian_additive=gaussian_additive)
         I = clamp_known(I0.clone(), imgs, M)
 
-        # random rollout depth (bias early epochs to short rollouts)
-        if rollout_bias:
-            lengths = list(range(1, K_train+1))
-            weights = torch.tensor([0.6*(0.7**(t-1)) for t in lengths])
-            weights = (weights / weights.sum()).to(device='cpu')
-            # K_curr = int(torch.multinomial(weights, 1).item() + 1)  # 1..K_train
-            K_curr = K_target
+        if fixed_K:
+            K_curr = K_train
         else:
-            # K_curr = random.randint(1, K_train)
-            K_curr = K_target
+            # random rollout depth (bias early epochs to short rollouts)
+            if rollout_bias:
+                lengths = list(range(1, K_train+1))
+                weights = torch.tensor([0.6*(0.7**(t-1)) for t in lengths])
+                weights = (weights / weights.sum()).to(device='cpu')
+                K_curr = int(torch.multinomial(weights, 1).item() + 1)  # 1..K_train
+            else:
+                K_curr = random.randint(1, K_train)
 
         sizes = sizes_default or [imgs.shape[-1]]
         steps_per = split_steps_train(K_curr, sizes, epoch=epoch)
@@ -98,9 +102,11 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 if guard_in_train:
                     I, _, _used_beta, ok, _dE = nftm_step_guarded(
                         I, gt_S, M_S, controller,
-                        beta=beta_S, use_gate=gate,
+                        beta=beta_S,
+                        use_gate=gate,
                         corr_clip=corr_clip_S,
-                        tvw=0.0, max_backtracks=2, shrink=0.5, clip_decay=clip_decay
+                        tvw=0.0,
+                        clip_decay=clip_decay
                     )
                     accepted_steps += int(ok)
                     backtracks += int(not ok)
@@ -110,14 +116,13 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                         beta=beta_S, use_gate=gate,
                         corr_clip=corr_clip_S, clip_decay=clip_decay
                     )
-                # ----- NEW: accumulate per-step MSE with linear weights -----
+                # accumulate per-step MSE with linear weights
                 if use_linear_steps:
                     step_idx += 1  # global step index across levels
-                    w_k = step_weights[step_idx - 1]       # scalar tensor
+                    w_k = step_weights[step_idx - 1]   # scalar tensor
                     # compare at current scale S against downsampled GT
                     step_mse = F.mse_loss(I, gt_S)
                     data_loss_accum = data_loss_accum + w_k * step_mse
-                # -----------------------------------------------------------
 
             if S != sizes[-1]:
                 nextS = sizes[lvl+1]
@@ -252,11 +257,17 @@ def eval_steps(controller, loader, device, K_eval=10,
             for s in range(T):
                 clip_decay = (0.92 ** s)
                 if descent_guard:
-                    I, _, _, _, _ = nftm_step_guarded(
-                        I, gt_S, M_S, controller, corr_clip=corr_clip_S, beta=beta_S,
-                        tvw=tvw, max_backtracks=3, shrink=0.5, clip_decay=clip_decay,
-                        use_gate=use_gate_flag,
+                    I, _, _used_beta, ok, _dE = nftm_step_guarded(
+                        I, gt_S, M_S, controller,
+                        beta=beta_S,
+                        use_gate=gate,
+                        corr_clip=corr_clip_S,
+                        tvw=0.0,
+                        clip_decay=clip_decay
                     )
+                    accepted_steps += int(ok)
+                    backtracks += int(not ok) # means "rejected steps"
+
                     gate_map = None
                 else:
                     if save_seq and bidx == 0 and use_gate_flag:
@@ -388,11 +399,17 @@ def evaluate_metrics_full(
             for s in range(T):
                 clip_decay = 0.92 ** s
                 if descent_guard:
-                    I, _, _, _, _ = nftm_step_guarded(I, gt_S, M_S, controller,
-                                                      beta=beta_S, use_gate=gate,
-                                                      corr_clip=corr_clip_S,
-                                                      tvw=tvw, max_backtracks=3, shrink=0.5,
-                                                      clip_decay=clip_decay)
+                    I, _, _used_beta, ok, _dE = nftm_step_guarded(
+                        I, gt_S, M_S, controller,
+                        beta=beta_S,
+                        use_gate=gate,
+                        corr_clip=corr_clip_S,
+                        tvw=0.0,
+                        clip_decay=clip_decay
+                    )
+                    accepted_steps += int(ok)
+                    backtracks += int(not ok) # means "rejected steps"
+
                 else:
                     I, _ = nftm_step(I, gt_S, M_S, controller, beta=beta_S, use_gate=gate,
                                      corr_clip=corr_clip_S, clip_decay=clip_decay)

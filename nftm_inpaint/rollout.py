@@ -3,6 +3,7 @@
 
 import os, random, argparse, json, numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
+import math
 
 # NEW: scale helpers
 def downsample_like(x: torch.Tensor, size: int) -> torch.Tensor:
@@ -25,8 +26,6 @@ def downsample_mask_minpool(mask: torch.Tensor, size: int) -> torch.Tensor:
         m = F.interpolate(mask, size=(size, size), mode='bilinear', align_corners=False)
         m = (m > 0.999).float()
     return m
-
-# --- Pyramid parsing & step allocation ---
 
 def parse_pyramid_arg(pyr: str, final_size: int):
     """Return an increasing list of sizes ending at final_size."""
@@ -148,48 +147,87 @@ def energy(I, I_gt, tvw=0.01):
 
 def nftm_step(I, I_gt, M, controller, beta: float | None = None, corr_clip=0.2, 
               clip_decay=1.0, use_gate: bool = False, return_gate=False):
-    """One step without guard; returns (I_new, logS)."""
-    dI, gate, logS = controller(I, M)
-    dI = dI.clamp(-corr_clip * clip_decay, corr_clip * clip_decay)
+    dI, gate, logS = controller(I.clamp(-1.0, 1.0), M)  # clamp controller input (important!)
+    
+    if corr_clip is not None and corr_clip > 0:
+        dI = dI.clamp(-corr_clip * clip_decay, corr_clip * clip_decay)
+
 
     b = 1.0 if beta is None else float(beta)
 
     if use_gate:
-        # safety clamp; if your controller already outputs sigmoid, this is a no-op
         gate_use = gate.clamp(0.0, 1.0)
         I_prop = I + b * gate_use * dI
     else:
         I_prop = I + b * dI
+
+    I_prop = I_prop.clamp(-1.0, 1.0) # clamp after update
     I_new = clamp_known(I_prop, I_gt, M)
-    
+    I_new = I_new.clamp(-1.0, 1.0) # keep state sane
+
     if return_gate:
         return I_new, logS, gate
     return I_new, logS
 
-def nftm_step_guarded(I, I_gt, M, controller, corr_clip=0.2, tvw=0.01, beta: float | None = None,
-                      max_backtracks=3, shrink=0.5, clip_decay=1.0, use_gate: bool = False):
+def nftm_step_guarded(
+    I, I_gt, M, controller,
+    corr_clip=0.2, tvw=0.01, beta: float | None = None,
+    max_backtracks=3, shrink=0.5, clip_decay=1.0,
+    use_gate: bool = False,
+    reject_mode: str | None = None,  # None => auto: "keep_ste" in train, "keep" in eval
+):
+    """
+    Fast guard (single-check):
+      - propose ONE step
+      - accept if energy decreases
+      - otherwise reject
+
+    Important:
+      - In TRAINING, default reject_mode="keep_ste" so gradients still flow even if rejected.
+      - In EVAL, default reject_mode="keep" (true rejection).
+    """
+    # auto mode: training needs grads, eval can hard-reject
+    if reject_mode is None:
+        reject_mode = "keep_ste" if controller.training else "keep"
+
     with torch.no_grad():
         E0 = energy(I, I_gt, tvw=tvw)
 
-    cur_beta = 1.0 if beta is None else float(beta)
-    last_I_prop, last_logS, last_beta = I, None, cur_beta
-    last_dE = 0.0
+    used_beta = 1.0 if beta is None else float(beta)
 
-    for _ in range(max_backtracks + 1):
-        I_prop, logS = nftm_step(I, I_gt, M, controller, beta=cur_beta, corr_clip=corr_clip, 
-                                 clip_decay=clip_decay, use_gate=use_gate)
+    # propose ONE step (this must stay in grad mode!)
+    I_prop, logS = nftm_step(
+        I, I_gt, M, controller,
+        beta=used_beta,
+        corr_clip=corr_clip,
+        clip_decay=clip_decay,
+        use_gate=use_gate
+    )
 
-        with torch.no_grad():
-            E1 = energy(I_prop, I_gt, tvw=tvw)
+    with torch.no_grad():
+        E1 = energy(I_prop, I_gt, tvw=tvw)
 
-        if E1 <= E0:
-            return I_prop, logS, cur_beta, True, float(E1 - E0)
+    dE = float(E1 - E0)
 
-        last_I_prop, last_logS, last_beta = I_prop, logS, cur_beta
-        last_dE = float(E1 - E0)
-        cur_beta *= shrink
+    if E1 <= E0:
+        return I_prop, logS, used_beta, True, dE
 
-    return last_I_prop, last_logS, last_beta, False, last_dE
+    # reject
+    if reject_mode == "keep":
+        # strict reject: no update (EVAL-friendly, but can kill grads in TRAIN)
+        return I, logS, used_beta, False, dE
+
+    if reject_mode == "keep_ste":
+        # forward: keep I (reject)
+        # backward: behave like I_prop (lets gradients flow)
+        I_out = I_prop + (I - I_prop).detach()
+        return I_out, logS, used_beta, False, dE
+
+    if reject_mode == "prop":
+        # accept the proposal anyway (not really a guard)
+        return I_prop, logS, used_beta, False, dE
+
+    raise ValueError(f"Unknown reject_mode: {reject_mode}")
 
 def count_params(m):
     return sum(p.numel() for p in m.parameters() if p.requires_grad)
@@ -214,3 +252,81 @@ def masked_metric_mean(metric_fn, a: torch.Tensor, b: torch.Tensor, mask: torch.
         frac_scalar = mask.mean().clamp_min(1e-6)
         scale = (1.0 / frac_scalar).to(device=val_tensor.device, dtype=val_tensor.dtype)
         return val_tensor * scale
+
+def estimate_sigma_max_update(controller, I: torch.Tensor, I_gt: torch.Tensor, M: torch.Tensor, *,
+    K: int = 1, corr_clip: float = 0.2, beta: float | None = None, 
+    clip_decay: float = 1.0, use_gate: bool = False,
+    power_iters: int = 8, eps: float = 1e-12, ) -> float:
+    """
+    Estimate sigma_max(J) of the map x -> missing-region state after K NFTM steps,
+    where x parameterizes ONLY the missing region (known pixels are clamped to GT).
+
+    Returns an estimate of the largest singular value (operator norm) of the Jacobian.
+
+    Notes:
+      - If sigma_max < 1 : locally contractive (good stability).
+      - If sigma_max > 1 : can amplify perturbations (instability possible).
+      - Uses power iteration on J^T J with autograd JVP/VJP.
+    """
+    controller_was_training = controller.training
+    controller.eval()  # deterministic
+
+    # We optimize/state only the unknown pixels; known pixels are clamped.
+    # x has same shape as I, but we only "care" about missing region by multiplying (1-M).
+    with torch.no_grad():
+        miss = (1.0 - M).to(dtype=I.dtype)
+
+    x0 = (I * miss).detach().requires_grad_(True)
+    M_fix = M.detach()
+    Igt_fix = I_gt.detach()
+
+    used_beta = 1.0 if beta is None else float(beta)
+
+    def f(x):
+        # rebuild full image with known pixels clamped
+        I_full = clamp_known(x, Igt_fix, M_fix).clamp(-1.0, 1.0)
+
+        # K-step rollout map (compose the update K times)
+        Icur = I_full
+        for _ in range(int(K)):
+            Icur, _ = nftm_step(
+                Icur, Igt_fix, M_fix, controller,
+                beta=used_beta,
+                corr_clip=corr_clip,
+                clip_decay=clip_decay,
+                use_gate=use_gate
+            )
+
+        # return ONLY missing region, since known region is always clamped anyway
+        return (Icur * miss)
+
+    # init power vector
+    v = torch.randn_like(x0)
+    v = v / (v.norm() + eps)
+
+    # Power iteration on J^T J
+    for _ in range(int(power_iters)):
+        # Jv
+        _, Jv = torch.autograd.functional.jvp(
+            f, (x0,), (v,), create_graph=False, strict=False
+        )
+        # J^T(Jv)
+        _, vjp = torch.autograd.functional.vjp(
+            f, (x0,), (Jv,), create_graph=False, strict=False
+        )
+        JTJv = vjp[0]
+        v = JTJv / (JTJv.norm() + eps)
+
+    # Rayleigh quotient to estimate largest eigenvalue of J^T J
+    _, Jv = torch.autograd.functional.jvp(f, (x0,), (v,), create_graph=False, strict=False)
+    _, vjp = torch.autograd.functional.vjp(f, (x0,), (Jv,), create_graph=False, strict=False)
+    JTJv = vjp[0]
+
+    num = (v * JTJv).sum()
+    den = (v * v).sum().clamp_min(eps)
+    lam = (num / den).abs()  # eigenvalue of JTJ (approx)
+    sigma = torch.sqrt(lam).item()   # sigma_max = sqrt(lam_max)
+
+    # restore mode
+    controller.train(controller_was_training)
+    return float(sigma)
