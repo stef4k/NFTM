@@ -68,8 +68,8 @@ def upsample_for_viz(x: torch.Tensor, scale: float) -> torch.Tensor:
 def plot_metric_curve(curve, save_path, ylabel, title):
     ensure_dir(os.path.dirname(save_path) or ".")
     plt.figure(figsize=(6,4))
-    plt.plot(range(1, len(curve)+1), curve, marker='o')
-    plt.xlabel("NFTM step"); plt.ylabel(ylabel)
+    plt.plot(range(len(curve)), curve, marker='o')
+    plt.xlabel("NFTM step (0 = init)"); plt.ylabel(ylabel)
     plt.title(title)
     plt.grid(True, alpha=0.3)
     plt.savefig(save_path, dpi=160)

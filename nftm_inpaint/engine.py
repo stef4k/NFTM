@@ -186,7 +186,12 @@ def eval_steps(controller, loader, device, K_eval=10,
         I0 = corrupt_images(imgs, M, noise_std=noise_std, noise_kind=noise_kind, **(noise_kwargs or {}),
                             gaussian_additive=gaussian_additive)
         I = clamp_known(I0.clone(), imgs, M)
-        step_psnrs, step_ssims, step_lpips = [], [], []
+        I0_metrics = I if I.shape[-1] == imgs.shape[-1] else upsample_like(I, imgs.shape[-1])
+        I0_metrics = I0_metrics.clamp(-1.0, 1.0)
+
+        step_psnrs = [_metric_psnr(I0_metrics, imgs).item()]
+        step_ssims = [_metric_ssim(I0_metrics, imgs).item()]
+        step_lpips = [_metric_lpips(I0_metrics, imgs).item()]
 
         gif_frames = []
         make_gif_frame = None
