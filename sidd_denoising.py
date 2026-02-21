@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
-# image_inpainting.py
-# NFTM-style iterative inpainting on CIFAR / CelebA-HQ + SIDD real-noise denoising.
-#
-# Key features:
-# - Iterative controller (TinyController or UNetController)
-# - Inpainting path (synthetic missing pixels + corruption) via nftm_inpaint.engine.train_epoch/eval_steps
-# - SIDD path (paired noisy->gt) with denoising loops (mask all-zeros)
-# - Optional per-epoch saved progress grids:
-#     - CIFAR/CelebA: via eval_steps (existing)
-#     - SIDD: saves MANY tiles with MANY step-columns (this file)
-# - Optional metrics.json saving
-# - Optional noise sweep for synthetic corruptions (NOT for SIDD)
+# sidd_denoising.py
+# NFTM-style iterative denoising on SIDD real-noise image pairs.
 
 import os, random, argparse, json, time, numpy as np
 from pathlib import Path
@@ -18,9 +8,7 @@ from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
-from torchvision.datasets import ImageFolder
-import torchvision as tv
+from torch.utils.data import DataLoader
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
 
@@ -38,21 +26,17 @@ from nftm_inpaint.metrics import (
     kid_init, kid_update, kid_compute,
 )
 
-# controllers / rollout helpers / engines
-from nftm_inpaint.data_and_viz import set_seed, get_transform, ensure_dir, plot_metric_curve
-from nftm_inpaint.rollout import parse_pyramid_arg, split_steps_eval, count_params
+# controllers / rollout helpers
+from nftm_inpaint.data_and_viz import set_seed, ensure_dir, plot_metric_curve
+from nftm_inpaint.rollout import count_params
 from nftm_inpaint.rollout import nftm_step, nftm_step_guarded, tv_l1, psnr
 from nftm_inpaint.controller import TinyController, UNetController
-from nftm_inpaint.engine import train_epoch, eval_steps, evaluate_metrics_full
 
 # wandb is optional; only import if actually used
 try:
     import wandb  # type: ignore
 except Exception:
     wandb = None
-
-root_dir = os.path.dirname(os.path.abspath(__file__))
-benchmarks_dir = os.path.join(root_dir, "benchmarks")
 
 # -------------------------- SIDD utilities --------------------------
 
@@ -809,7 +793,7 @@ def evaluate_metrics_sidd_denoise(
 # -------------------------- main --------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="NFTM-style iterative inpainting + SIDD denoising")
+    parser = argparse.ArgumentParser(description="NFTM-style iterative denoising on SIDD")
 
     # train
     parser.add_argument("--epochs", type=int, default=10)
@@ -836,25 +820,14 @@ def main():
     parser.add_argument("--gate", action="store_true")
     parser.add_argument("--step_loss", type=str, default="final", choices=["final", "linear"])
 
-    # inpainting corruption
-    parser.add_argument("--pmin", type=float, default=0.25)
-    parser.add_argument("--pmax", type=float, default=0.5)
-    parser.add_argument("--block_prob", type=float, default=0.5)
-    parser.add_argument("--noise_std", type=float, default=0.3)
-    parser.add_argument("--gaussian_additive", action="store_true",
-                        help="Only for synthetic corruption (inpainting).")
-
     # model
     parser.add_argument("--width", type=int, default=48)
     parser.add_argument("--controller", type=str, default="dense", choices=["dense", "unet"])
     parser.add_argument("--unet_base", type=int, default=10)
 
-    # data
-    parser.add_argument("--train_dataset", type=str, default="cifar", choices=["cifar", "celebahq", "sidd"])
-    parser.add_argument("--benchmark", type=str, default="cifar", choices=["cifar", "set12", "cbsd68", "celebahq", "sidd"])
-    parser.add_argument("--img_size", type=int, default=32, choices=[32, 64, 128])
-
-    # SIDD
+    # data (SIDD-only)
+    parser.add_argument("--train_dataset", type=str, default="sidd", choices=["sidd"])
+    parser.add_argument("--benchmark", type=str, default="sidd", choices=["sidd"])
     parser.add_argument("--sidd_root", type=str, default="", help="Path to SIDD_Medium_Srgb (must contain Data/)")
     parser.add_argument("--sidd_index_dir", type=str, default="benchmarks/SIDD/index")
     parser.add_argument("--sidd_train_frac", type=float, default=0.8)
@@ -865,7 +838,7 @@ def main():
     parser.add_argument("--sidd_epoch_tiles", type=int, default=0,
                         help="Randomly sample this many SIDD train tiles per epoch (0 = use all available tiles).")
 
-    # NEW: SIDD visualization controls (only affects saved PNG grids)
+    # SIDD visualization controls (only affects saved PNG grids)
     parser.add_argument("--sidd_viz_samples", type=int, default=50,
                         help="How many different SIDD tiles to visualize per eval epoch.")
     parser.add_argument("--sidd_viz_pngs", type=int, default=10,
@@ -873,7 +846,7 @@ def main():
     parser.add_argument("--sidd_viz_max_steps", type=int, default=24,
                         help="Max number of step-columns to show. If K_eval <= this, show all steps; else show evenly spaced steps.")
 
-    # NEW: SIDD full-image reconstruction
+    # SIDD full-image reconstruction
     parser.add_argument("--sidd_save_full_images", action="store_true",
                         help="Reconstruct and save full SIDD test images by stitching denoised tiles.")
     parser.add_argument("--sidd_full_max_images", type=int, default=0,
@@ -887,21 +860,12 @@ def main():
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--eval_max_batches", type=int, default=50)
 
-    # pyramid (inpainting only)
-    parser.add_argument("--pyramid", type=str, default="")
-    parser.add_argument("--pyr_steps", type=str, default="")
-    parser.add_argument("--viz_scale", type=float, default=1.0)
-
     # outputs
     parser.add_argument("--save_dir", type=str, default="out")
     parser.add_argument("--save_epoch_progress", action="store_true",
                         help="Save per-epoch visuals for eval.")
     parser.add_argument("--save_metrics", action="store_true",
                         help="Save metrics.json and curves.")
-
-    # sweep (synthetic only)
-    parser.add_argument("--eval_noise_sweep", action="store_true",
-                        help="Synthetic corruption sweep (NOT for SIDD).")
 
     # misc
     parser.add_argument("--seed", type=int, default=0)
@@ -919,94 +883,45 @@ def main():
 
     train_dataset_name = args.train_dataset.lower()
     benchmark = args.benchmark.lower()
+    if train_dataset_name != "sidd" or benchmark != "sidd":
+        raise ValueError("[SIDD] This script is SIDD-only. Use --train_dataset sidd --benchmark sidd.")
 
-    # SIDD consistency
-    is_sidd = (train_dataset_name == "sidd" and benchmark == "sidd")
-    if (train_dataset_name == "sidd") ^ (benchmark == "sidd"):
-        raise ValueError("[SIDD] For denoising, set BOTH --train_dataset sidd and --benchmark sidd")
+    if not args.sidd_root:
+        raise ValueError("[SIDD] Missing --sidd_root")
 
-    # sizes
-    img_size = int(args.img_size)
-    if is_sidd:
-        if not args.sidd_root:
-            raise ValueError("[SIDD] Missing --sidd_root")
-        if args.img_size != args.patch_size:
-            print(f"[SIDD] Overriding img_size {args.img_size} -> patch_size {args.patch_size}")
-        img_size = int(args.patch_size)
+    patch_size = int(args.patch_size)
 
     # datasets
-    sidd_test_jsonl = None
-    if is_sidd:
-        train_jsonl, test_jsonl = _sidd_make_or_load_index(
-            sidd_root=args.sidd_root,
-            index_dir=args.sidd_index_dir,
-            train_frac=args.sidd_train_frac,
-            seed=args.seed,
-        )
-        sidd_test_jsonl = test_jsonl
-        limit = None if args.sidd_limit_tiles <= 0 else int(args.sidd_limit_tiles)
-        train_set = SIDDIndexTiles(train_jsonl, patch=img_size, stride=int(args.patch_stride), limit_tiles=limit)
-        test_set  = SIDDIndexTiles(test_jsonl,  patch=img_size, stride=int(args.patch_stride), limit_tiles=limit)
-    else:
-        if train_dataset_name == "cifar":
-            transform_train = get_transform("cifar", img_size=img_size)
-            train_set = tv.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform_train)
-        elif train_dataset_name == "celebahq":
-            transform_train = get_transform("celebahq", img_size=img_size)
-            train_set = ImageFolder(root=os.path.join(benchmarks_dir, "CelebAHQ"), transform=transform_train)
-        else:
-            raise ValueError(f"Unknown train dataset: {args.train_dataset}")
+    train_jsonl, test_jsonl = _sidd_make_or_load_index(
+        sidd_root=args.sidd_root,
+        index_dir=args.sidd_index_dir,
+        train_frac=args.sidd_train_frac,
+        seed=args.seed,
+    )
+    sidd_test_jsonl = test_jsonl
+    limit = None if args.sidd_limit_tiles <= 0 else int(args.sidd_limit_tiles)
+    train_set = SIDDIndexTiles(train_jsonl, patch=patch_size, stride=int(args.patch_stride), limit_tiles=limit)
+    test_set = SIDDIndexTiles(test_jsonl, patch=patch_size, stride=int(args.patch_stride), limit_tiles=limit)
 
-        transform_test = get_transform(benchmark, img_size=img_size)
-        if benchmark == "cifar":
-            test_set = tv.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
-        elif benchmark == "set12":
-            test_set = ImageFolder(root="./benchmarks/Set12", transform=transform_test)
-        elif benchmark == "cbsd68":
-            test_set = ImageFolder(root="./benchmarks/CBSD68", transform=transform_test)
-        elif (benchmark == "celebahq") and train_dataset_name == "celebahq":
-            train_size = int(0.8 * len(train_set))
-            test_size = len(train_set) - train_size
-            train_set, test_set = random_split(
-                train_set, [train_size, test_size],
-                generator=torch.Generator().manual_seed(42)
-            )
-        elif benchmark == "celebahq":
-            test_set = ImageFolder(root=os.path.join(benchmarks_dir, "CelebAHQ"), transform=transform_test)
-        else:
-            raise ValueError(f"Unknown benchmark dataset: {args.benchmark}")
-
-    # pyramids (inpainting only)
-    if is_sidd:
-        pyr_sizes = [img_size]
-        pyr_steps_eval = [args.K_eval]
-    else:
-        pyr_sizes = parse_pyramid_arg(args.pyramid, img_size)
-        pyr_steps_eval = split_steps_eval(args.K_eval, pyr_sizes, args.pyr_steps if args.pyr_steps else None)
-
-    print(f"[Data] train_dataset={train_dataset_name}, benchmark={benchmark}, img_size={img_size}")
+    print(f"[Data] train_dataset={train_dataset_name}, benchmark={benchmark}, patch_size={patch_size}")
     print(f"[Data] train_set size={len(train_set)}, test_set size={len(test_set)}")
 
     # loaders
     use_cuda_pinning = (device.type == "cuda")
-
-    if is_sidd:
-        nw = min(2, os.cpu_count() or 2)
-    else:
-        nw = min(8, os.cpu_count() or 8)
+    nw = min(2, os.cpu_count() or 2)
 
     loader_kwargs = dict(pin_memory=use_cuda_pinning)
     if nw > 0:
         loader_kwargs.update(dict(
             num_workers=nw,
             persistent_workers=True,
-            prefetch_factor=2 if is_sidd else 4
+            prefetch_factor=2
         ))
     else:
         loader_kwargs.update(dict(num_workers=0))
 
     train_sampler = None
-    if is_sidd and int(args.sidd_epoch_tiles) > 0:
+    if int(args.sidd_epoch_tiles) > 0:
         train_sampler = SIDDPerEpochSubsetSampler(
             dataset_size=len(train_set),
             samples_per_epoch=int(args.sidd_epoch_tiles),
@@ -1018,7 +933,7 @@ def main():
         train_loader = DataLoader(train_set, batch_size=args.batch_size, sampler=train_sampler, shuffle=False, **loader_kwargs)
     else:
         train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
-    test_loader  = DataLoader(test_set,  batch_size=args.batch_size, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
 
     # model
     controller_info = {"name": args.controller}
@@ -1088,83 +1003,47 @@ def main():
             beta = min(beta_start + beta_anneal * (ep - 1), beta_max)
             beta_eval = min(beta + beta_eval_bonus, 0.9)
 
-        if is_sidd:
-            train_loss, train_psnr, stats = train_epoch_sidd_denoise(
-                controller, opt, train_loader, device, epoch=ep,
-                K_target=args.K_train,
-                beta=beta if beta is not None else 0.35,
-                beta_max=beta_max if beta_max is not None else 0.85,
+        train_loss, train_psnr, stats = train_epoch_sidd_denoise(
+            controller, opt, train_loader, device, epoch=ep,
+            K_target=args.K_train,
+            beta=beta if beta is not None else 0.35,
+            beta_max=beta_max if beta_max is not None else 0.85,
+            gate=args.gate,
+            tvw=args.tv_weight,
+            corr_clip=args.corr_clip,
+            guard_in_train=args.guard_in_train,
+            contract_w=args.contract_w,
+            step_loss_mode=args.step_loss,
+        )
+
+        do_eval = (args.eval_every > 0) and ((ep % args.eval_every == 0) or (ep == args.epochs))
+        if do_eval:
+            curves = eval_steps_sidd_denoise(
+                controller, test_loader, device,
+                K_eval=args.K_eval,
+                beta=beta_eval if beta_eval is not None else 0.6,
                 gate=args.gate,
-                tvw=args.tv_weight,
                 corr_clip=args.corr_clip,
-                guard_in_train=args.guard_in_train,
-                contract_w=args.contract_w,
-                step_loss_mode=args.step_loss,
+                tvw=0.0,
+                descent_guard=False,
+                max_batches=args.eval_max_batches,
             )
 
-            do_eval = (args.eval_every > 0) and ((ep % args.eval_every == 0) or (ep == args.epochs))
-            if do_eval:
-                curves = eval_steps_sidd_denoise(
+            if args.save_epoch_progress and steps_dir:
+                dump_sidd_progress_grids(
                     controller, test_loader, device,
                     K_eval=args.K_eval,
                     beta=beta_eval if beta_eval is not None else 0.6,
                     gate=args.gate,
                     corr_clip=args.corr_clip,
-                    tvw=0.0,
-                    descent_guard=False,
-                    max_batches=args.eval_max_batches,
+                    save_dir=steps_dir,
+                    epoch_tag=f"ep{ep:03d}",
+                    total_samples=args.sidd_viz_samples,
+                    num_pngs=args.sidd_viz_pngs,
+                    max_step_cols=args.sidd_viz_max_steps,
                 )
-
-                # NEW: dump many tiles with many step-columns (like inpainting)
-                if args.save_epoch_progress and steps_dir:
-                    dump_sidd_progress_grids(
-                        controller, test_loader, device,
-                        K_eval=args.K_eval,
-                        beta=beta_eval if beta_eval is not None else 0.6,
-                        gate=args.gate,
-                        corr_clip=args.corr_clip,
-                        save_dir=steps_dir,
-                        epoch_tag=f"ep{ep:03d}",
-                        total_samples=args.sidd_viz_samples,
-                        num_pngs=args.sidd_viz_pngs,
-                        max_step_cols=args.sidd_viz_max_steps,
-                    )
-            else:
-                curves = {"psnr": np.array([]), "ssim": np.array([]), "lpips": np.array([])}
-
         else:
-            train_loss, train_psnr, stats = train_epoch(
-                controller, opt, train_loader, device, epoch=ep,
-                K_target=args.K_train, K_base=4,
-                beta=beta, gate=args.gate, beta_max=beta_max,
-                tvw=args.tv_weight,
-                p_missing=(args.pmin, args.pmax),
-                block_prob=args.block_prob,
-                noise_std=args.noise_std,
-                corr_clip=args.corr_clip,
-                guard_in_train=args.guard_in_train,
-                contract_w=args.contract_w,
-                rollout_bias=True,
-                pyramid_sizes=pyr_sizes,
-                step_loss_mode=args.step_loss,
-                gaussian_additive=args.gaussian_additive,
-            )
-
-            curves = eval_steps(
-                controller, test_loader, device,
-                K_eval=args.K_eval, beta=beta_eval, gate=args.gate,
-                p_missing=(args.pmin, args.pmax),
-                block_prob=args.block_prob,
-                noise_std=args.noise_std,
-                corr_clip=args.corr_clip,
-                descent_guard=False, tvw=0.0,
-                save_per_epoch_dir=steps_dir,
-                epoch_tag=ep,
-                pyramid_sizes=pyr_sizes,
-                steps_split=pyr_steps_eval,
-                viz_scale=max(1.0, float(args.viz_scale)),
-                gaussian_additive=args.gaussian_additive,
-            )
+            curves = {"psnr": np.array([]), "ssim": np.array([]), "lpips": np.array([])}
 
         psnr_curve = curves["psnr"]
         ssim_curve = curves["ssim"]
@@ -1180,7 +1059,7 @@ def main():
 
         beta_str = f"{beta:.3f}" if beta is not None else "off"
         line = (
-            f"[ep {ep:02d}] β_train={beta_str} | K_train={stats['train_K']} | "
+            f"[ep {ep:02d}] beta_train={beta_str} | K_train={stats['train_K']} | "
             f"loss {train_loss:.4f} | train PSNR {train_psnr:.2f} dB | "
             f"eval PSNR 0..{args.K_eval}: {curve_str} ... {tail_val} | ctrl={args.controller}"
         )
@@ -1238,34 +1117,14 @@ def main():
     # ------------------------- metrics.json -------------------------
     summary = {}
     if args.save_metrics:
-        if is_sidd:
-            metrics_full = evaluate_metrics_sidd_denoise(
-                controller, test_loader, device,
-                K_eval=args.K_eval,
-                beta=beta_eval_final if beta_eval_final is not None else 0.6,
-                gate=args.gate,
-                corr_clip=args.corr_clip,
-                max_batches=0
-            )
-        else:
-            metrics_full = evaluate_metrics_full(
-                controller,
-                test_loader,
-                device,
-                K_eval=args.K_eval,
-                beta=beta_eval_final,
-                gate=args.gate,
-                p_missing=(args.pmin, args.pmax),
-                block_prob=args.block_prob,
-                noise_std=args.noise_std,
-                corr_clip=args.corr_clip,
-                descent_guard=False,
-                tvw=0.0,
-                benchmark=benchmark,
-                pyramid_sizes=pyr_sizes,
-                steps_split=pyr_steps_eval,
-                gaussian_additive=args.gaussian_additive
-            )
+        metrics_full = evaluate_metrics_sidd_denoise(
+            controller, test_loader, device,
+            K_eval=args.K_eval,
+            beta=beta_eval_final if beta_eval_final is not None else 0.6,
+            gate=args.gate,
+            corr_clip=args.corr_clip,
+            max_batches=0
+        )
 
         summary = dict(
             epochs=args.epochs,
@@ -1277,12 +1136,13 @@ def main():
             beta_eval_bonus=args.beta_eval_bonus,
             corr_clip=args.corr_clip,
             tv_weight=args.tv_weight,
-            pmin=args.pmin, pmax=args.pmax, block_prob=args.block_prob,
-            noise_std=args.noise_std,
             final_psnr=float(psnr_curve[-1]) if psnr_curve is not None and psnr_curve.size > 0 else None,
             params=float(param_total),
             seed=int(args.seed),
             controller=args.controller,
+            train_dataset=train_dataset_name,
+            benchmark=benchmark,
+            patch_size=patch_size,
         )
         if args.controller == "unet":
             summary["unet_base"] = int(controller_info.get("base", args.unet_base))
@@ -1303,7 +1163,7 @@ def main():
         print(f"[metrics] saved {os.path.join(args.save_dir, 'metrics.json')}")
 
     # ------------------------- SIDD full-image reconstruction -------------------------
-    if is_sidd and args.sidd_save_full_images:
+    if args.sidd_save_full_images:
         if not sidd_test_jsonl:
             raise RuntimeError("[SIDD] Missing test index for full-image reconstruction.")
         full_dir = os.path.join(args.save_dir, "sidd_full")
@@ -1326,83 +1186,6 @@ def main():
             tile_pad=int(args.sidd_full_tile_pad),
         )
 
-    # ------------------------- synthetic noise sweep (NOT for SIDD) -------------------------
-    if args.eval_noise_sweep:
-        if is_sidd:
-            print("[SIDD] eval_noise_sweep skipped: SIDD is real sensor noise (no synthetic corruption sweep).")
-        else:
-            sweep = [
-                ("gaussian",   {"noise_std": args.noise_std}),
-                ("uniform",    {}),
-                ("saltpepper", {"prob": 0.10}),
-                ("saltpepper", {"prob": 0.20}),
-                ("poisson",    {"peak": 30.0}),
-                ("poisson",    {"peak": 10.0}),
-                ("speckle",    {"noise_std": 0.20}),
-            ]
-
-            sweep_dir = os.path.join(args.save_dir, "noise_sweep")
-            ensure_dir(sweep_dir)
-
-            beta_eval_sweep = beta_eval_final
-            all_results = {}
-
-            for noise_kind, kw in sweep:
-                tag = "_".join([noise_kind] + [f"{k}{v}" for k, v in kw.items()])
-                out_dir = os.path.join(sweep_dir, tag)
-                ensure_dir(out_dir)
-
-                noise_std_use = float(kw.get("noise_std", args.noise_std))
-                noise_kwargs = dict(kw)
-                noise_kwargs.pop("noise_std", None)
-
-                _ = eval_steps(
-                    controller, test_loader, device,
-                    K_eval=args.K_eval, beta=beta_eval_sweep, gate=args.gate,
-                    p_missing=(args.pmin, args.pmax),
-                    block_prob=args.block_prob,
-                    noise_std=noise_std_use,
-                    corr_clip=args.corr_clip,
-                    descent_guard=False, tvw=0.0,
-                    save_per_epoch_dir=out_dir,
-                    epoch_tag="final",
-                    pyramid_sizes=pyr_sizes,
-                    steps_split=pyr_steps_eval,
-                    viz_scale=max(1.0, float(args.viz_scale)),
-                    gaussian_additive=args.gaussian_additive
-                )
-
-                if args.save_metrics:
-                    metrics_one = evaluate_metrics_full(
-                        controller,
-                        test_loader,
-                        device,
-                        K_eval=args.K_eval,
-                        beta=beta_eval_sweep,
-                        gate=args.gate,
-                        p_missing=(args.pmin, args.pmax),
-                        block_prob=args.block_prob,
-                        noise_std=noise_std_use,
-                        corr_clip=args.corr_clip,
-                        descent_guard=False,
-                        tvw=0.0,
-                        benchmark=benchmark,
-                        pyramid_sizes=pyr_sizes,
-                        steps_split=pyr_steps_eval,
-                        noise_kind=noise_kind,
-                        noise_kwargs=noise_kwargs,
-                        gaussian_additive=args.gaussian_additive
-                    )
-                    all_results[tag] = metrics_one
-                    with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as f:
-                        json.dump(metrics_one, f, indent=2)
-
-            if args.save_metrics:
-                with open(os.path.join(sweep_dir, "noise_sweep.json"), "w", encoding="utf-8") as f:
-                    json.dump(all_results, f, indent=2)
-
-            print("[noise-sweep] saved under:", sweep_dir)
-
     # wandb final
     if args.use_wandb:
         if summary:
@@ -1420,3 +1203,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
