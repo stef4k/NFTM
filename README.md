@@ -206,12 +206,9 @@ Then download the datasets:
 
    ```bash
    python image_inpainting.py --benchmark [benchmark_name]
-
+     ```
 Available benchmark options: `cifar, set12, cbsd68, celebahq`
-
-
-
-
-
-
-
+For the SIDD dataset run:
+   ```bash
+   python sidd_denoising.py
+   ```
