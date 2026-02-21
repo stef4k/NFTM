@@ -200,6 +200,8 @@ Then download the datasets:
 
 - CBSD68: Download the dataset from [Kaggle](https://www.kaggle.com/datasets/tarekmebrouk/cbsd68), extract only the `train` folder and place it in `benchmarks/CBSD68/all_images/`
 
+- SIDD: Download the dataset from [github](https://abdokamel.github.io/sidd/), download only the `SIDD-Medium Dataset` > `sRGB images only` > `Mirror 1` or directly from this [link](http://130.63.97.225/share/SIDD_Medium_Srgb.zip) and place the unzipped items in `benchmarks/SIDD/`
+
 2. **After setup, run benchmarks using:**
 
    ```bash
