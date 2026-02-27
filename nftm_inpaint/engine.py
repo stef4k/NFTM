@@ -102,11 +102,9 @@ def train_epoch(controller, opt, loader, device, epoch, K_target=10, K_base=4,
                 if guard_in_train:
                     I, _, _used_beta, ok, _dE = nftm_step_guarded(
                         I, gt_S, M_S, controller,
-                        beta=beta_S,
-                        use_gate=gate,
+                        beta=beta_S, use_gate=gate,
                         corr_clip=corr_clip_S,
-                        tvw=0.0,
-                        clip_decay=clip_decay
+                        tvw=0.0, max_backtracks=2, shrink=0.5, clip_decay=clip_decay
                     )
                     accepted_steps += int(ok)
                     backtracks += int(not ok)
@@ -186,12 +184,12 @@ def eval_steps(controller, loader, device, K_eval=10,
         I0 = corrupt_images(imgs, M, noise_std=noise_std, noise_kind=noise_kind, **(noise_kwargs or {}),
                             gaussian_additive=gaussian_additive)
         I = clamp_known(I0.clone(), imgs, M)
-        I0_metrics = I if I.shape[-1] == imgs.shape[-1] else upsample_like(I, imgs.shape[-1])
-        I0_metrics = I0_metrics.clamp(-1.0, 1.0)
+        I_metrics0 = I if I.shape[-1] == imgs.shape[-1] else upsample_like(I, imgs.shape[-1])
+        I_metrics0 = I_metrics0.clamp(-1.0, 1.0)
 
-        step_psnrs = [_metric_psnr(I0_metrics, imgs).item()]
-        step_ssims = [_metric_ssim(I0_metrics, imgs).item()]
-        step_lpips = [_metric_lpips(I0_metrics, imgs).item()]
+        step_psnrs = [_metric_psnr(I_metrics0, imgs).item()]
+        step_ssims = [_metric_ssim(I_metrics0, imgs).item()]
+        step_lpips = [_metric_lpips(I_metrics0, imgs).item()]
 
         gif_frames = []
         make_gif_frame = None
@@ -262,17 +260,11 @@ def eval_steps(controller, loader, device, K_eval=10,
             for s in range(T):
                 clip_decay = (0.92 ** s)
                 if descent_guard:
-                    I, _, _used_beta, ok, _dE = nftm_step_guarded(
-                        I, gt_S, M_S, controller,
-                        beta=beta_S,
-                        use_gate=gate,
-                        corr_clip=corr_clip_S,
-                        tvw=0.0,
-                        clip_decay=clip_decay
+                    I, _, _, _, _ = nftm_step_guarded(
+                        I, gt_S, M_S, controller, corr_clip=corr_clip_S, beta=beta_S,
+                        tvw=tvw, max_backtracks=3, shrink=0.5, clip_decay=clip_decay,
+                        use_gate=use_gate_flag,
                     )
-                    accepted_steps += int(ok)
-                    backtracks += int(not ok) # means "rejected steps"
-
                     gate_map = None
                 else:
                     if save_seq and bidx == 0 and use_gate_flag:
@@ -404,17 +396,11 @@ def evaluate_metrics_full(
             for s in range(T):
                 clip_decay = 0.92 ** s
                 if descent_guard:
-                    I, _, _used_beta, ok, _dE = nftm_step_guarded(
-                        I, gt_S, M_S, controller,
-                        beta=beta_S,
-                        use_gate=gate,
-                        corr_clip=corr_clip_S,
-                        tvw=0.0,
-                        clip_decay=clip_decay
-                    )
-                    accepted_steps += int(ok)
-                    backtracks += int(not ok) # means "rejected steps"
-
+                    I, _, _, _, _ = nftm_step_guarded(I, gt_S, M_S, controller,
+                                                      beta=beta_S, use_gate=gate,
+                                                      corr_clip=corr_clip_S,
+                                                      tvw=tvw, max_backtracks=3, shrink=0.5,
+                                                      clip_decay=clip_decay)
                 else:
                     I, _ = nftm_step(I, gt_S, M_S, controller, beta=beta_S, use_gate=gate,
                                      corr_clip=corr_clip_S, clip_decay=clip_decay)
