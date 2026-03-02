@@ -317,8 +317,13 @@ def main(argv: List[str] | None = None) -> None:
 
     parser.add_argument("--train_dataset", type=str, default="cifar", choices=["cifar", "celebahq"], help="Dataset for training")
     parser.add_argument("--benchmark", type=str, default="cifar", choices=["cifar", "set12", "cbsd68", "celebahq"],help="choose test dataset for benchmarking")
-    parser.add_argument("--img_size", type=int, default=32, choices=[32, 64], help="Input image size (resize if necessary)")
+    parser.add_argument("--img_size", type=int, default=32, choices=[32, 64, 128], help="Input image size (resize if necessary)")
     parser.add_argument("--quick", action="store_true", help="Run a very fast debug version")
+    parser.add_argument("--diff_timesteps", type=int, default=500)
+    parser.add_argument("--diff_beta_start", type=float, default=1e-4)
+    parser.add_argument("--diff_beta_end", type=float, default=2e-2)
+    parser.add_argument("--diff_model", type=str, default="tiny", choices=["tiny", "big"])
+
 
 
     args = parser.parse_args(argv)
@@ -355,6 +360,9 @@ def main(argv: List[str] | None = None) -> None:
         "tvl1": os.path.join(base_dir, "tvl1"),
         "nftm_dense_pyramid": os.path.join(base_dir, "nftm_dense_pyramid"),
     }
+    
+    dirs["unet_diffusion"] = os.path.join(base_dir, "unet_diffusion")
+    dirs["unet_diffusion_eval"] = os.path.join(base_dir, "unet_diffusion_eval")
     if args.include_nftm:
         dirs["nftm"] = os.path.join(base_dir, "nftm")
     
@@ -373,7 +381,82 @@ def main(argv: List[str] | None = None) -> None:
 
     nftm_runs: List[Tuple[str, str]] = []
     try:
-    
+        
+        _run_stage(
+            "train_unet_diffusion",
+            [
+                py_executable,
+                os.path.join(INPAINT_DIR, "train_unet_diffusion.py"),
+                "--epochs",
+                str(baseline_epochs),
+                "--batch_size",
+                str(args.batch_size),
+                "--lr",
+                str(args.lr),
+                "--weight_decay",
+                str(args.wd),
+                "--seed",
+                str(args.seed),
+                "--save_dir",
+                dirs["unet_diffusion"],
+                "--base",
+                str(32),
+                # str(args.unet_base),
+                "--target_params",
+                str(args.target_params),
+                "--num_workers",
+                str(args.num_workers),
+                "--device",
+                resolved_device,
+                "--benchmark",
+                str(args.benchmark),
+                "--img_size",
+                str(args.img_size),
+                "--train_dataset",
+                str(args.train_dataset),
+                "--timesteps",
+                str(args.diff_timesteps),
+                "--beta_start",
+                str(args.diff_beta_start),
+                "--beta_end",
+                str(args.diff_beta_end),
+                "--diff_model",
+                str(args.diff_model),
+            ],
+        )
+
+        _run_stage(
+            "eval_unet_diffusion",
+            [
+                py_executable,
+                os.path.join(INPAINT_DIR, "eval_unet_diffusion.py"),
+                "--ckpt",
+                os.path.join(dirs["unet_diffusion"], "ckpt.pt"),
+                "--batch_size",
+                str(args.batch_size),
+                "--num_workers",
+                str(args.num_workers),
+                "--seed",
+                str(args.seed),
+                "--save_dir",
+                dirs["unet_diffusion_eval"],
+                "--device",
+                resolved_device,
+                "--benchmark",
+                str(args.benchmark),
+                "--img_size",
+                str(args.img_size),
+                "--timesteps",
+                str(args.diff_timesteps),
+                "--beta_start",
+                str(args.diff_beta_start),
+                "--beta_end",
+                str(args.diff_beta_end),
+                "--diff_model",
+                str(args.diff_model),
+            ],
+        )
+
         _run_stage(
             "nftm_pyramid",
             [
@@ -457,7 +540,7 @@ def main(argv: List[str] | None = None) -> None:
                 str(args.img_size)
             ],
         )
-
+        
         _run_stage(
             "tvl1_baseline",
             [
@@ -537,6 +620,8 @@ def main(argv: List[str] | None = None) -> None:
     summary: Dict[str, Dict[str, float]] = {}
     try:
         summary["unet"] = _load_metrics(os.path.join(dirs["unet_eval"], "metrics.json"))
+        
+        summary["unet_diffusion"] = _load_metrics(os.path.join(dirs["unet_diffusion_eval"], "metrics.json"))
         summary["tvl1"] = _load_metrics(os.path.join(dirs["tvl1"], "metrics.json"))
         if args.include_nftm and "nftm" in dirs:
             summary["nftm"] = _load_metrics(os.path.join(dirs["nftm"], "metrics.json"))
@@ -558,7 +643,11 @@ def main(argv: List[str] | None = None) -> None:
         json.dump(summary, fp, indent=2)
     print(f"[info] summary written to {summary_path}")
 
-    _pretty_print(summary, ["unet", "tvl1", "nftm"])
+    methods = ["unet"]
+    
+    methods.append("unet_diffusion")
+    methods.extend(["tvl1", "nftm"])
+    _pretty_print(summary, methods)
 
     if args.include_nftm and nftm_runs:
         try:
