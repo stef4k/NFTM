@@ -1,6 +1,8 @@
 # NFTM
 
-Neural Field Turing Machine experiments implementing differentiable cellular automata and diffusion processes.
+Neural Field Turing Machine experiments implementing differentiable cellular automata and diffusion processes. Find:
+- [The final report](https://github.com/stef4k/NFTM/blob/main/BDRP_presentation.pdf)
+- [The final presentation](https://github.com/stef4k/NFTM/blob/main/BDRP_presentation.pdf)
 
 ## Setup
 
